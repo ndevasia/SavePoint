@@ -66,6 +66,45 @@
       cursor: not-allowed;
     }
 
+    .cloud-status {
+      margin: 10px 0 6px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid rgba(0, 255, 255, 0.35);
+      background: rgba(0, 0, 0, 0.45);
+      color: #9fe9ff;
+      font-size: 0.9em;
+      line-height: 1.45;
+    }
+
+    .cloud-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .cloud-row label {
+      flex: 1;
+      color: #ffffff;
+      font-size: 0.9em;
+    }
+
+    .cloud-row input {
+      flex: 1.2;
+      min-width: 0;
+      padding: 6px 10px;
+      border: 1px solid #00ffff;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.8);
+      color: #00ffff;
+      font-family: 'Share Tech Mono', monospace;
+    }
+
+    .cloud-row input:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     .settings-actions {
       display: flex;
       gap: 12px;
@@ -93,8 +132,43 @@
       <input id="local-only-storage" type="checkbox">
       <label for="local-only-storage" class="settings-copy">
         <strong>Use local-only storage</strong>
-        <small>When enabled, videos, metadata, and annotations are kept locally and not uploaded to S3 automatically.</small>
+        <small>When enabled, videos, metadata, and annotations are kept locally and not uploaded to S3 automatically. Sessions are always written locally first, so this is safe to leave on.</small>
       </label>
+    </div>
+
+    <div class="settings-field" style="margin-top: 24px; border-top: 1px solid rgba(0, 255, 255, 0.3); padding-top: 18px;">
+      <strong style="color: #00ffff;">Cloud storage (AWS S3)</strong>
+      <small style="color: #9fe9ff; display: block; margin-bottom: 4px;">Optional. Without it the app runs entirely on this machine — nothing here is needed to record, annotate, or review.</small>
+      <div id="cloud-status" class="cloud-status">Checking cloud storage...</div>
+
+      <div id="cloud-fields" style="display: flex; flex-direction: column; gap: 10px; margin-top: 4px;">
+        <div class="cloud-row">
+          <label for="aws-region">Region:</label>
+          <input id="aws-region" type="text" placeholder="us-west-2" spellcheck="false">
+        </div>
+        <div class="cloud-row">
+          <label for="aws-bucket">Bucket:</label>
+          <input id="aws-bucket" type="text" placeholder="my-study-bucket" spellcheck="false">
+        </div>
+        <div class="cloud-row">
+          <label for="aws-role-arn">Role ARN:</label>
+          <input id="aws-role-arn" type="text" placeholder="arn:aws:iam::123456789012:role/..." spellcheck="false">
+        </div>
+        <div class="cloud-row">
+          <label for="aws-access-key-id">Access key ID:</label>
+          <input id="aws-access-key-id" type="text" spellcheck="false">
+        </div>
+        <div class="cloud-row">
+          <label for="aws-secret-access-key">Secret access key:</label>
+          <input id="aws-secret-access-key" type="password" spellcheck="false">
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
+          <button type="button" class="button-small" onclick="testCloudConnection()">Test connection</button>
+          <button type="button" class="button-small" id="cloud-export-btn" onclick="exportCloudConfig()">Export to backend/.env</button>
+        </div>
+        <small id="cloud-test-result" style="color: #9fe9ff;"></small>
+        <small id="cloud-export-help" style="color: #9fe9ff;">Saving keeps credentials on this machine only. Export writes them into <code>backend/.env</code> so they ship with a packaged build — use that when preparing a build for study participants.</small>
+      </div>
     </div>
     <div class="settings-row">
       <input id="show-recent-notes-overlay" type="checkbox">
@@ -185,6 +259,94 @@
     const recentNotesCountInput = document.getElementById('recent-notes-count');
     const displaySelect = document.getElementById('display-select');
     const displayHelp = document.getElementById('display-help');
+    const cloudStatusEl = document.getElementById('cloud-status');
+    const cloudFieldsEl = document.getElementById('cloud-fields');
+    const cloudTestResult = document.getElementById('cloud-test-result');
+    const cloudExportBtn = document.getElementById('cloud-export-btn');
+    const cloudExportHelp = document.getElementById('cloud-export-help');
+
+    const awsInputs = {
+      region: document.getElementById('aws-region'),
+      bucket: document.getElementById('aws-bucket'),
+      roleArn: document.getElementById('aws-role-arn'),
+      accessKeyId: document.getElementById('aws-access-key-id'),
+      secretAccessKey: document.getElementById('aws-secret-access-key'),
+    };
+
+    // True when backend/.env supplies credentials, e.g. in a build distributed
+    // to study participants. The form is then read-only, since saved values
+    // would be ignored anyway.
+    let cloudManagedByBuild = false;
+
+    function collectAwsConfig() {
+      const config = {};
+      for (const [field, input] of Object.entries(awsInputs)) {
+        config[field] = input.value.trim();
+      }
+      return config;
+    }
+
+    function renderCloudStatus(status) {
+      cloudManagedByBuild = Boolean(status && status.managedByBuild);
+      const canExport = Boolean(status && status.canExportToEnv);
+
+      // A distributed build withholds its credentials, so there is nothing to
+      // populate and nothing editable — hide the form rather than show empties.
+      cloudFieldsEl.hidden = Boolean(status && status.redacted);
+      if (cloudFieldsEl.hidden) {
+        cloudStatusEl.textContent = status.available
+          ? 'Connected. Cloud storage is configured by this app build.'
+          : 'Cloud storage is configured by this app build, but the connection failed. Sessions are being saved to this machine — contact the study organizer.';
+        return;
+      }
+
+      const config = (status && status.config) || {};
+      for (const [field, input] of Object.entries(awsInputs)) {
+        input.value = config[field] || '';
+      }
+
+      cloudExportBtn.hidden = !canExport;
+      cloudExportHelp.hidden = !canExport;
+
+      const sourceNote = cloudManagedByBuild
+        ? ' These values come from backend/.env, which takes precedence — use Export to change them.'
+        : '';
+
+      if (status && status.available) {
+        cloudStatusEl.textContent = `Connected.${sourceNote}`;
+      } else if (status && status.error) {
+        cloudStatusEl.textContent = `Not connected: ${status.error}${sourceNote}`;
+      } else {
+        cloudStatusEl.textContent = 'Not configured. The app is running local-only — fill in all five fields below to enable cloud sync.';
+      }
+    }
+
+    async function exportCloudConfig() {
+      cloudTestResult.textContent = 'Exporting...';
+      try {
+        const result = await ipcRenderer.invoke('export-cloud-config-to-env', collectAwsConfig());
+        if (result.canceled) {
+          cloudTestResult.textContent = 'Export canceled.';
+        } else if (result.success) {
+          cloudTestResult.textContent = `Written to ${result.path}`;
+          renderCloudStatus(await ipcRenderer.invoke('get-cloud-status'));
+        } else {
+          cloudTestResult.textContent = `Export failed: ${result.error}`;
+        }
+      } catch (error) {
+        cloudTestResult.textContent = `Export failed: ${error && error.message ? error.message : error}`;
+      }
+    }
+
+    async function testCloudConnection() {
+      cloudTestResult.textContent = 'Testing...';
+      try {
+        const result = await ipcRenderer.invoke('test-cloud-config', collectAwsConfig());
+        cloudTestResult.textContent = result.success ? 'Connection succeeded.' : `Failed: ${result.error}`;
+      } catch (error) {
+        cloudTestResult.textContent = `Failed: ${error && error.message ? error.message : error}`;
+      }
+    }
 
     // Hotkey input elements
     const hotkeyInputs = {
@@ -242,10 +404,13 @@
 
     async function loadSettings() {
       try {
-        const [settings, displays] = await Promise.all([
+        const [settings, displays, cloudStatus] = await Promise.all([
           ipcRenderer.invoke('get-settings'),
           ipcRenderer.invoke('get-available-displays'),
+          ipcRenderer.invoke('get-cloud-status'),
         ]);
+
+        renderCloudStatus(cloudStatus);
 
         recordAllDisplaysCheckbox.checked = settings.recordAllDisplays !== false;
         localOnlyStorageCheckbox.checked = settings.localOnlyStorage === true;
@@ -277,7 +442,7 @@
 
     async function saveSettings() {
       const count = Math.max(1, Math.min(10, parseInt(recentNotesCountInput.value) || 3));
-      await ipcRenderer.invoke('save-settings', {
+      const payload = {
         recordAllDisplays: recordAllDisplaysCheckbox.checked,
         selectedDisplayId: displaySelect.value || null,
         localOnlyStorage: localOnlyStorageCheckbox.checked,
@@ -296,7 +461,15 @@
           emoji5: hotkeyInputs.emoji5.value,
           emoji6: hotkeyInputs.emoji6.value,
         },
-      });
+      };
+
+      // A build-supplied configuration always wins, so don't shadow it with a
+      // copy of the same values in the user's config file.
+      if (!cloudManagedByBuild) {
+        payload.aws = collectAwsConfig();
+      }
+
+      await ipcRenderer.invoke('save-settings', payload);
       ipcRenderer.send('close-settings');
     }
 
