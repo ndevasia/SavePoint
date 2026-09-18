@@ -46,6 +46,8 @@ let appConfig = {
   selectedDisplayId: null,
   localOnlyStorage: false,
   recordingBackend: 'ffmpeg', // 'ffmpeg' or 'obs'
+  captureAudio: false,
+  selectedAudioDeviceId: null,
   showRecentNotesOverlay: true,
   enablePostGameReview: false,
   recentNotesCount: 3,
@@ -834,29 +836,171 @@ function showFFMpegMissingDialog(details = '') {
   return choice === 1;
 }
 
-function parseMacCaptureDevice(ffmpegPath) {
-  const ffmpegResult = spawnSync(
-    ffmpegPath,
-    ['-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '""'],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+const DEVICE_LIST_TIMEOUT_MS = 5000;
 
-  const lines = ffmpegResult.stderr.toString().split('\n');
-  const screenLine = lines.find((line) => {
-    const lower = line.toLowerCase();
-    return lower.includes('capture screen') || lower.includes('screen');
+// FFMPEG prints device listings to stderr and then exits non-zero, so the exit
+// status is not a useful signal here -- only the stderr text matters.
+function runDeviceListing(command, args) {
+  const result = spawnSync(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: DEVICE_LIST_TIMEOUT_MS,
+    windowsHide: true,
   });
 
-  if (!screenLine) {
-    return '1:none';
+  if (result.error) {
+    throw result.error;
   }
 
-  const match = screenLine.match(/\[(\d+)\]/);
-  if (!match) {
-    return '1:none';
+  return {
+    stdout: result.stdout ? result.stdout.toString() : '',
+    stderr: result.stderr ? result.stderr.toString() : '',
+    status: result.status,
+  };
+}
+
+// Parses `-f dshow -list_devices true`. Handles both the modern layout, where
+// each device line is tagged `(audio)`/`(video)`, and the older layout that
+// groups devices under "DirectShow audio devices" headers.
+function parseDShowDevices(ffmpegPath) {
+  const { stderr } = runDeviceListing(ffmpegPath, [
+    '-hide_banner', '-f', 'dshow', '-list_devices', 'true', '-i', 'dummy',
+  ]);
+
+  const devices = [];
+  let section = null;
+
+  stderr.split('\n').forEach((rawLine) => {
+    const line = rawLine.replace(/^\[dshow @ [^\]]*\]\s*/, '').trim();
+
+    if (/DirectShow video devices/i.test(line)) {
+      section = 'video';
+      return;
+    }
+    if (/DirectShow audio devices/i.test(line)) {
+      section = 'audio';
+      return;
+    }
+
+    // "Alternative name" always belongs to the device listed just above it.
+    const altMatch = line.match(/^Alternative name\s+"(.+)"$/i);
+    if (altMatch && devices.length) {
+      devices[devices.length - 1].altName = altMatch[1];
+      return;
+    }
+
+    const nameMatch = line.match(/^"(.+?)"(?:\s+\((audio|video)\))?$/i);
+    if (!nameMatch) {
+      return;
+    }
+
+    // Video devices are collected too, so that a following "Alternative name"
+    // line is not misattributed to the previous audio device. Filtered below.
+    devices.push({
+      id: nameMatch[1],
+      label: nameMatch[1],
+      altName: null,
+      kind: nameMatch[2] ? nameMatch[2].toLowerCase() : section,
+    });
+  });
+
+  return devices.filter((device) => device.kind === 'audio');
+}
+
+function parseAVFoundationDevices(ffmpegPath) {
+  const { stderr } = runDeviceListing(ffmpegPath, [
+    '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '""',
+  ]);
+
+  const videoDevices = [];
+  const audioDevices = [];
+  let section = null;
+
+  stderr.split('\n').forEach((rawLine) => {
+    const line = rawLine.replace(/^\[AVFoundation[^\]]*\]\s*/, '').trim();
+
+    if (/AVFoundation video devices/i.test(line)) {
+      section = 'video';
+      return;
+    }
+    if (/AVFoundation audio devices/i.test(line)) {
+      section = 'audio';
+      return;
+    }
+
+    const match = line.match(/^\[(\d+)\]\s+(.*)$/);
+    if (!match || !section) {
+      return;
+    }
+
+    const device = { id: match[1], label: match[2].trim() };
+    (section === 'video' ? videoDevices : audioDevices).push(device);
+  });
+
+  return { videoDevices, audioDevices };
+}
+
+// FFMPEG cannot enumerate PulseAudio sources, so ask PulseAudio directly.
+function parsePulseSources() {
+  const defaultSource = { id: 'default', label: 'Default system source' };
+
+  let listing;
+  try {
+    listing = runDeviceListing('pactl', ['list', 'short', 'sources']);
+  } catch {
+    return [defaultSource];
   }
 
-  return `${match[1]}:none`;
+  if (listing.status !== 0) {
+    return [defaultSource];
+  }
+
+  const sources = listing.stdout
+    .split('\n')
+    .map((line) => line.split('\t')[1])
+    .filter(Boolean)
+    .map((name) => ({ id: name, label: name }));
+
+  return [defaultSource, ...sources];
+}
+
+function listAudioCaptureDevices(ffmpegPath) {
+  const resolvedPath = ffmpegPath || ffmpegExecutablePath || resolveFFMpegPath();
+
+  try {
+    if (process.platform === 'win32') {
+      return parseDShowDevices(resolvedPath);
+    }
+    if (process.platform === 'darwin') {
+      return parseAVFoundationDevices(resolvedPath).audioDevices;
+    }
+    return parsePulseSources();
+  } catch (err) {
+    console.warn('Could not enumerate audio capture devices:', err.message);
+    return [];
+  }
+}
+
+function resolveAudioCaptureDevice(ffmpegPath) {
+  const devices = listAudioCaptureDevices(ffmpegPath);
+  if (!devices.length) {
+    return null;
+  }
+
+  const configuredId = appConfig.selectedAudioDeviceId;
+  const configured = configuredId
+    ? devices.find((device) => String(device.id) === String(configuredId))
+    : null;
+
+  if (configuredId && !configured) {
+    console.warn(`Configured audio device "${configuredId}" was not found; falling back to "${devices[0].label}".`);
+  }
+
+  return configured || devices[0];
+}
+
+function findMacScreenDeviceIndex(videoDevices) {
+  const screenDevice = videoDevices.find((device) => device.label.toLowerCase().includes('screen'));
+  return screenDevice ? screenDevice.id : '1';
 }
 
 function getDisplayCaptureConfig() {
@@ -889,14 +1033,24 @@ function getDisplayCaptureConfig() {
   };
 }
 
-function getFFMpegRecordingArgs(ffmpegPath, outputPath) {
+function getFFMpegRecordingArgs(ffmpegPath, outputPath, { includeAudio = false } = {}) {
   const args = ['-hide_banner', '-y'];
+  const audioDevice = includeAudio ? resolveAudioCaptureDevice(ffmpegPath) : null;
+
+  if (includeAudio && !audioDevice) {
+    console.warn('Audio capture is enabled but no capture device was found; recording video only.');
+  }
+
+  // gdigrab/x11grab cannot capture audio, so audio arrives as a second input
+  // that has to be mapped explicitly. avfoundation takes both in one input.
+  let hasSeparateAudioInput = false;
 
   if (process.platform === 'win32') {
     const captureConfig = getDisplayCaptureConfig();
     args.push(
       '-f', 'gdigrab',
       '-framerate', '30',
+      '-thread_queue_size', '1024',
     );
 
     if (captureConfig.offsetX !== null && captureConfig.offsetY !== null && captureConfig.size) {
@@ -910,27 +1064,60 @@ function getFFMpegRecordingArgs(ffmpegPath, outputPath) {
     args.push(
       '-i', captureConfig.input
     );
+
+    if (audioDevice) {
+      args.push(
+        '-f', 'dshow',
+        '-thread_queue_size', '1024',
+        '-i', `audio=${audioDevice.altName || audioDevice.id}`
+      );
+      hasSeparateAudioInput = true;
+    }
   } else if (process.platform === 'darwin') {
-    const captureDevice = parseMacCaptureDevice(ffmpegPath);
+    const { videoDevices } = parseAVFoundationDevices(ffmpegPath);
+    const screenIndex = findMacScreenDeviceIndex(videoDevices);
     args.push(
       '-f', 'avfoundation',
       '-framerate', '30',
-      '-i', captureDevice
+      '-i', `${screenIndex}:${audioDevice ? audioDevice.id : 'none'}`
     );
   } else {
     args.push(
       '-f', 'x11grab',
       '-framerate', '30',
+      '-thread_queue_size', '1024',
       '-i', process.env.DISPLAY || ':0.0'
     );
+
+    if (audioDevice) {
+      args.push(
+        '-f', 'pulse',
+        '-thread_queue_size', '1024',
+        '-i', audioDevice.id
+      );
+      hasSeparateAudioInput = true;
+    }
+  }
+
+  if (hasSeparateAudioInput) {
+    args.push('-map', '0:v', '-map', '1:a');
   }
 
   args.push(
     '-c:v', 'libx264',
     '-preset', 'veryfast',
-    '-pix_fmt', 'yuv420p',
-    outputPath
+    '-pix_fmt', 'yuv420p'
   );
+
+  if (audioDevice) {
+    console.log(`Capturing audio from: ${audioDevice.label}`);
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', '160k'
+    );
+  }
+
+  args.push(outputPath);
 
   return args;
 }
@@ -946,7 +1133,27 @@ async function startFFMpegRecording() {
 
   const ffmpegPath = ffmpegExecutablePath || resolveFFMpegPath();
   currentRecordingPath = path.join(recordingsDir, `recording_${Date.now()}.mp4`);
-  const args = getFFMpegRecordingArgs(ffmpegPath, currentRecordingPath);
+  const wantsAudio = appConfig.captureAudio === true;
+
+  try {
+    await spawnFFMpegRecording(ffmpegPath, currentRecordingPath, { includeAudio: wantsAudio });
+  } catch (err) {
+    if (!wantsAudio) {
+      throw err;
+    }
+    // A missing/busy capture device makes FFMPEG exit at startup. Losing the
+    // whole session over that is worse than losing the audio track.
+    console.warn(`FFMPEG could not start with audio capture (${err.message}); retrying without audio.`);
+    await spawnFFMpegRecording(ffmpegPath, currentRecordingPath, { includeAudio: false });
+  }
+
+  sessionMetadata.setVideoStartTimestamp(Date.now());
+  maybeWriteSessionMetadata();
+  console.log('FFMPEG recording started');
+}
+
+async function spawnFFMpegRecording(ffmpegPath, outputPath, { includeAudio }) {
+  const args = getFFMpegRecordingArgs(ffmpegPath, outputPath, { includeAudio });
 
   console.log('Starting FFMPEG recording');
   if (isDebug) {
@@ -995,10 +1202,6 @@ async function startFFMpegRecording() {
       }
     });
   });
-
-  sessionMetadata.setVideoStartTimestamp(Date.now());
-  maybeWriteSessionMetadata();
-  console.log('FFMPEG recording started');
 }
 
 
@@ -1651,6 +1854,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('get-available-displays', () => {
     return getAvailableDisplays();
+  });
+  ipcMain.handle('get-available-audio-devices', () => {
+    return listAudioCaptureDevices().map((device) => ({
+      id: String(device.id),
+      label: device.label,
+    }));
   });
   ipcMain.handle('save-settings', async (event, settings) => {
     await saveSettings(settings);
