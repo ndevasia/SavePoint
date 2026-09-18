@@ -5,18 +5,25 @@ const { spawnTracked, killAllChildren } = require("./backend/processManager.js")
 const isDebug = process.argv.includes('--debug');
 const path = require('path');
 const AWSManager = require('./backend/aws.js');
+const {
+  resolveCloudConfig,
+  readSettingsCloudConfig,
+  isCloudConfigComplete,
+  getEnvFilePath,
+  writeEnvCloudConfig,
+} = require('./backend/cloudConfig.js');
 const SessionMetadata = require('./backend/metadata.js')
 const { readConfig, writeConfig } = require('./config.js');
 const sessionMetadata = new SessionMetadata();
 const { readUsername, writeUsername, submitUsername } = require('./username.js');
 const os = require('./os.js')
 
+// Null whenever cloud storage is unconfigured or unreachable. The app is fully
+// usable in that state — everything falls back to local storage.
 let awsManager = null;
+let cloudStatus = { available: false, source: 'none', error: null };
 
 var focusedWindow = null;
-
-// Instead of this, write it as an env variable and not a weird one off file
-var writeToAWS = true;
 
 if (app.isPackaged) {
   console.log("Running packaged version of the app");
@@ -44,6 +51,14 @@ let appConfig = {
   showRecentNotesOverlay: true,
   enablePostGameReview: false,
   recentNotesCount: 3,
+  // Only consulted when backend/.env does not already supply a full set.
+  aws: {
+    region: '',
+    bucket: '',
+    roleArn: '',
+    accessKeyId: '',
+    secretAccessKey: '',
+  },
   hotkeys: {
     annotationWindow: 'CommandOrControl+Shift+N',
     showPastSessions: 'CommandOrControl+Shift+O',
@@ -89,8 +104,54 @@ async function ensureLocalSessionDirs(username) {
   ]);
 }
 
+/**
+ * Build the S3 client if — and only if — credentials are available and usable.
+ * Never throws: a missing or broken configuration just leaves the app local-only.
+ */
+async function initCloud() {
+  awsManager = null;
+  const resolved = resolveCloudConfig(appConfig);
+
+  if (!resolved.complete) {
+    cloudStatus = { available: false, source: 'none', error: null };
+    console.log('Cloud storage is not configured — running local-only.');
+    return cloudStatus;
+  }
+
+  try {
+    const manager = new AWSManager(sessionMetadata.getUsername(), resolved.config);
+    await manager.init();
+    awsManager = manager;
+    cloudStatus = { available: true, source: resolved.source, error: null };
+    console.log(`Cloud storage ready (credentials from ${resolved.source}).`);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    cloudStatus = { available: false, source: resolved.source, error: message };
+    console.warn('Cloud storage unavailable — continuing local-only:', message);
+  }
+
+  return cloudStatus;
+}
+
+/**
+ * appConfig minus the credential block. Renderers need the rest of the settings
+ * but never the keys — the cloud form is populated from get-cloud-status, which
+ * redacts them in a distributed build.
+ */
+function publicAppConfig() {
+  const { aws, ...rest } = appConfig;
+  return rest;
+}
+
+function requireAwsManager(action) {
+  if (!awsManager) {
+    throw new Error(`Cloud storage is not available, so ${action} cannot continue. Add AWS credentials under Settings → Cloud storage.`);
+  }
+  return awsManager;
+}
+
 function shouldUploadToS3() {
-  return !appConfig.localOnlyStorage;
+  return !appConfig.localOnlyStorage && Boolean(awsManager);
 }
 
 async function saveMetadataLocally() {
@@ -259,6 +320,7 @@ async function listLocalSessions(username) {
 }
 
 async function uploadLocalSession(username, fileTimestamp) {
+  const aws = requireAwsManager('uploading this session');
   const paths = getLocalSessionPaths(username, fileTimestamp);
   if (!fs.existsSync(paths.videoPath) || !fs.existsSync(paths.metadataPath)) {
     throw new Error('Local session files are incomplete.');
@@ -276,9 +338,9 @@ async function uploadLocalSession(username, fileTimestamp) {
     annotationsBuffer = Buffer.from(JSON.stringify([], null, 2));
   }
 
-  await awsManager.uploadFile(videoBuffer, username, fileTimestamp, 'videos');
-  await awsManager.uploadFile(metadataBuffer, username, fileTimestamp, 'metadata');
-  await awsManager.uploadFile(annotationsBuffer, username, fileTimestamp, 'annotations');
+  await aws.uploadFile(videoBuffer, username, fileTimestamp, 'videos');
+  await aws.uploadFile(metadataBuffer, username, fileTimestamp, 'metadata');
+  await aws.uploadFile(annotationsBuffer, username, fileTimestamp, 'annotations');
 
   await cleanupLocalSession(username, fileTimestamp);
 }
@@ -566,6 +628,8 @@ function createNoteWindow() {
     noteWindow = null;
   }
 
+  const isMac = process.platform === 'darwin';
+
   noteWindow = new BrowserWindow({
     width: 400,
     height: 200,
@@ -576,11 +640,22 @@ function createNoteWindow() {
     skipTaskbar: true,
     focusable: true,
     show: false,
+    // macOS only: a panel is an NSPanel with the non-activating style mask, so it
+    // can take keyboard input without making this app frontmost. That means the
+    // game never loses focus and there is nothing to restore afterwards — the
+    // job os/windows.js does with SetForegroundWindow. Windows keeps a normal
+    // window; passing a type there would change its behavior.
+    ...(isMac ? { type: 'panel' } : {}),
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
     }
   });
+
+  if (isMac) {
+    // Let the overlay appear over a game running in its own fullscreen Space.
+    noteWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  }
 
   noteWindow.loadFile('overlay.html');
 
@@ -1158,7 +1233,12 @@ function registerShortcuts() {
       noteWindow.setFocusable(true);
       noteWindow.setIgnoreMouseEvents(false);
       noteWindow.show();
-      noteWindow.focus();
+      // On macOS show() already makes the non-activating panel the key window.
+      // focus() would additionally activate the app and pull the game out of the
+      // foreground — exactly what the panel exists to avoid.
+      if (process.platform !== 'darwin') {
+        noteWindow.focus();
+      }
     }
     if (noteWindow) {
       noteWindow.webContents.send('show-annotation-ui');
@@ -1285,9 +1365,15 @@ async function startSession() {
 
 async function saveSettings(partialSettings) {
   const oldHotkeys = appConfig.hotkeys;
+  const oldAws = JSON.stringify(appConfig.aws || {});
   appConfig = { ...appConfig, ...partialSettings };
   await writeConfig(appConfig);
-  
+
+  // Re-connect (or disconnect) so new credentials apply without a restart.
+  if (JSON.stringify(appConfig.aws || {}) !== oldAws) {
+    await initCloud();
+  }
+
   // If hotkeys have changed, re-register them
   if (oldHotkeys && JSON.stringify(oldHotkeys) !== JSON.stringify(appConfig.hotkeys)) {
     reRegisterShortcuts();
@@ -1333,8 +1419,8 @@ app.whenReady().then(async () => {
   if (!sessionMetadata.getUsername()) {
     await createUsernamePrompt();
   }
-  awsManager = new AWSManager(sessionMetadata.getUsername());
-  await awsManager.init();
+  // Non-fatal: the app runs local-only when cloud storage is off or misconfigured.
+  await initCloud();
 
   const ffmpegCheck = checkFFMpegAvailable();
   ffmpegReady = ffmpegCheck.available;
@@ -1423,17 +1509,109 @@ app.whenReady().then(async () => {
     return sessionMetadata.getVideoStartTimestamp();
     });
   ipcMain.handle('get-settings', () => {
-    return appConfig;
+    return publicAppConfig();
   });
   ipcMain.handle('get-available-displays', () => {
     return getAvailableDisplays();
   });
   ipcMain.handle('save-settings', async (event, settings) => {
     await saveSettings(settings);
-    return appConfig;
+    return publicAppConfig();
+  });
+  ipcMain.handle('get-cloud-status', () => {
+    const resolved = resolveCloudConfig(appConfig);
+    const managedByBuild = resolved.source === 'env';
+
+    // Credentials baked into a distributed build must never reach the settings
+    // window: a participant could read them straight out of the form. Withhold
+    // them entirely rather than masking, since a mask still ships the value.
+    // On a checkout this does not apply — that machine owns backend/.env
+    // already, and the Export flow needs the real values in the form.
+    const redacted = managedByBuild && app.isPackaged;
+
+    return {
+      available: cloudStatus.available,
+      // 'env' means backend/.env supplied the credentials currently in force.
+      source: resolved.source,
+      managedByBuild,
+      // backend/.env sits inside the asar archive once packaged, so exporting
+      // is only offered while running from a checkout.
+      canExportToEnv: !app.isPackaged,
+      envPath: getEnvFilePath(),
+      redacted,
+      // Show whatever is actually in effect, so the form never disagrees with
+      // the credentials the app is really using.
+      config: redacted
+        ? null
+        : (resolved.complete ? resolved.config : readSettingsCloudConfig(appConfig)),
+      // AWS errors quote the role and account ARNs, so keep the detail in the
+      // main-process log rather than putting it on a participant's screen.
+      error: redacted ? null : cloudStatus.error,
+    };
+  });
+  ipcMain.handle('export-cloud-config-to-env', async (event, config) => {
+    if (app.isPackaged) {
+      throw new Error('backend/.env cannot be written from inside a packaged build.');
+    }
+    if (!isCloudConfigComplete(config)) {
+      return { success: false, error: 'Fill in every field before exporting.' };
+    }
+
+    const envPath = getEnvFilePath();
+    const fileExists = fs.existsSync(envPath);
+    const confirmLabel = fileExists ? 'Overwrite' : 'Create file';
+
+    const { response } = await dialog.showMessageBox(settingsWindow, {
+      type: 'question',
+      buttons: ['Cancel', confirmLabel],
+      defaultId: 1,
+      cancelId: 0,
+      title: 'Export credentials to backend/.env',
+      message: fileExists
+        ? 'Replace the AWS values in backend/.env?'
+        : 'Create backend/.env with these AWS values?',
+      detail: `${envPath}\n\nAny other keys already in the file are left untouched. These credentials will be bundled into any build packaged from this checkout, so only do this for a build you intend to distribute.`,
+    });
+
+    if (response !== 1) {
+      return { success: false, canceled: true };
+    }
+
+    await writeEnvCloudConfig(config);
+    await initCloud();
+    return { success: true, path: envPath };
+  });
+  ipcMain.handle('test-cloud-config', async (event, config) => {
+    if (!isCloudConfigComplete(config)) {
+      return { success: false, error: 'Fill in every field before testing the connection.' };
+    }
+    try {
+      const probe = new AWSManager(sessionMetadata.getUsername(), config);
+      await probe.init();
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err && err.message ? err.message : String(err) };
+    }
   });
   ipcMain.handle('get-local-sessions', async (event, username) => {
     return listLocalSessions(username);
+  });
+  ipcMain.handle('load-s3-sessions', async (event, username) => {
+    if (!awsManager || !username) return [];
+    return awsManager.loadSessionsFromS3(username);
+  });
+  ipcMain.handle('delete-s3-session', async (event, { videoUrl }) => {
+    const aws = requireAwsManager('deleting this cloud session');
+    const deleted = await aws.deleteSession(videoUrl);
+    if (!deleted) {
+      throw new Error('Failed to delete the cloud session.');
+    }
+    return { success: true };
+  });
+  ipcMain.handle('delete-s3-annotation', async (event, { annotationUrl, timestamp }) => {
+    const aws = requireAwsManager('deleting this cloud annotation');
+    await aws.deleteAnnotation(annotationUrl, timestamp);
+    return { success: true };
   });
   ipcMain.handle('upload-local-session', async (event, { username, fileTimestamp }) => {
     if (!username || !fileTimestamp) {
@@ -1451,13 +1629,11 @@ app.whenReady().then(async () => {
     return { success: true };
   });
   ipcMain.handle('update-s3-session-review', async (event, { username, fileTimestamp, review }) => {
-    if (!awsManager) {
-      throw new Error('AWS Manager not initialized');
-    }
+    const aws = requireAwsManager('saving this review to the cloud');
     if (!username || !fileTimestamp) {
       throw new Error('Username and fileTimestamp are required to update S3 session review.');
     }
-    await awsManager.updateSessionReview(username, fileTimestamp, review || '');
+    await aws.updateSessionReview(username, fileTimestamp, review || '');
     return { success: true };
   });
   ipcMain.handle('download-local-session', async (event, { username, fileTimestamp }) => {
@@ -1493,9 +1669,7 @@ app.whenReady().then(async () => {
     }
   });
   ipcMain.handle('download-s3-session', async (event, { username, fileTimestamp }) => {
-    if (!awsManager) {
-      throw new Error('AWS Manager not initialized');
-    }
+    const aws = requireAwsManager('downloading this cloud session');
 
     const result = await dialog.showSaveDialog(homeWindow, {
       title: 'Download Session Files from Cloud',
@@ -1516,21 +1690,21 @@ app.whenReady().then(async () => {
       const annotationsKey = `${username}/annotations/${fileTimestamp}.json`;
 
       try {
-        const videoBuffer = await awsManager.getFileFromS3(videoKey);
+        const videoBuffer = await aws.getFileFromS3(videoKey);
         await fs.promises.writeFile(path.join(destDir, `${fileTimestamp}.mkv`), videoBuffer);
       } catch (err) {
         console.warn('Video file not found in S3, continuing...');
       }
 
       try {
-        const metadataBuffer = await awsManager.getFileFromS3(metadataKey);
+        const metadataBuffer = await aws.getFileFromS3(metadataKey);
         await fs.promises.writeFile(path.join(destDir, `${fileTimestamp}_metadata.json`), metadataBuffer);
       } catch (err) {
         console.warn('Metadata file not found in S3, continuing...');
       }
 
       try {
-        const annotationsBuffer = await awsManager.getFileFromS3(annotationsKey);
+        const annotationsBuffer = await aws.getFileFromS3(annotationsKey);
         await fs.promises.writeFile(path.join(destDir, `${fileTimestamp}_annotations.json`), annotationsBuffer);
       } catch (err) {
         console.warn('Annotations file not found in S3, continuing...');

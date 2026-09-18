@@ -1,18 +1,38 @@
 const AWS = require('aws-sdk');
-require('dotenv').config({ path: __dirname + '/.env' }); // __dirname resolves to backend/
 const SessionMetadata = require('./metadata.js')
+const { readEnvCloudConfig, isCloudConfigComplete } = require('./cloudConfig.js');
 
 class AWSManager {
-  constructor(username) {
+  // cloudConfig is optional so existing callers keep working; it defaults to
+  // whatever backend/.env supplied. Constructing this is always safe — init()
+  // is where a missing or bad configuration surfaces.
+  constructor(username, cloudConfig) {
+    const config = cloudConfig || readEnvCloudConfig();
     this.username = username;
-    this.bucket = process.env.AWS_BUCKET_NAME;
-    this.region = process.env.AWS_REGION;
-    this.arn = process.env.AWS_ROLE_ARN;
+    this.bucket = config.bucket;
+    this.region = config.region;
+    this.arn = config.roleArn;
+    this.accessKeyId = config.accessKeyId;
+    this.secretAccessKey = config.secretAccessKey;
     this.s3 = null; // will be initialized asynchronously
   }
 
+  isConfigured() {
+    return isCloudConfigComplete({
+      region: this.region,
+      bucket: this.bucket,
+      roleArn: this.arn,
+      accessKeyId: this.accessKeyId,
+      secretAccessKey: this.secretAccessKey,
+    });
+  }
+
   async init() {
-    const sts = new AWS.STS({ region: this.region, accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
+    if (!this.isConfigured()) {
+      throw new Error('AWS credentials are incomplete. Set them in backend/.env or under Settings → Cloud storage.');
+    }
+
+    const sts = new AWS.STS({ region: this.region, accessKeyId: this.accessKeyId, secretAccessKey: this.secretAccessKey });
     const data = await sts.assumeRole({
       RoleArn: this.arn,
       RoleSessionName: `session-${this.username}-${Date.now()}`,

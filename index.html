@@ -387,7 +387,6 @@
   <script>
     const fs = require('fs');
     const { ipcRenderer } = require('electron');
-    const AWSManager = require('./backend/aws.js');
 
     const sessionContainer = document.getElementById('sessions');
     const loadMoreBtn = document.getElementById('load-more');
@@ -398,11 +397,11 @@
     const reviewEditorCancelBtn = document.getElementById('review-editor-cancel');
     const reviewEditorSaveBtn = document.getElementById('review-editor-save');
 
-    let client;
     let allSessions = [];
     let visibleCount = 0;
     let activeUsername = null;
     let isReviewModeEnabled = false;
+    let isCloudAvailable = false;
     let liveRefreshTimer = null;
     const liveSessionViews = new Map();
     const PAGE_SIZE = 5;
@@ -441,17 +440,19 @@
       }
 
       activeUsername = username;
-      client = new AWSManager(username);
 
       try {
-        await client.init();
-        const [s3Sessions, localSessions, settings] = await Promise.all([
-          client.loadSessionsFromS3(username),
+        // All S3 access goes through the main process, which returns an empty
+        // list when cloud storage is off — local sessions still render.
+        const [s3Sessions, localSessions, settings, cloudStatus] = await Promise.all([
+          ipcRenderer.invoke('load-s3-sessions', username),
           ipcRenderer.invoke('get-local-sessions', username),
           ipcRenderer.invoke('get-settings'),
+          ipcRenderer.invoke('get-cloud-status'),
         ]);
 
         isReviewModeEnabled = Boolean(settings && settings.enablePostGameReview);
+        isCloudAvailable = Boolean(cloudStatus && cloudStatus.available);
 
         const normalizedS3Sessions = s3Sessions.map((session) => ({
           ...session,
@@ -718,7 +719,10 @@
             if (session.source === 'local') {
               deleteLocalAnnotation(session, a.timestamp);
             } else {
-              await client.deleteAnnotation(session.annotationUrl, a.timestamp);
+              await ipcRenderer.invoke('delete-s3-annotation', {
+                annotationUrl: session.annotationUrl,
+                timestamp: a.timestamp,
+              });
             }
             note.remove();
             knownTimestamps.delete(a.timestamp);
@@ -801,7 +805,7 @@
               fileTimestamp: session.fileTimestamp,
             });
           } else {
-            await client.deleteSession(session.videoUrl);
+            await ipcRenderer.invoke('delete-s3-session', { videoUrl: session.videoUrl });
           }
           sessionDiv.remove();
         } catch (err) {
@@ -872,7 +876,7 @@
         buttonContainer.appendChild(downloadS3Btn);
       }
 
-      if (session.source === 'local' && !session.isInProgress) {
+      if (session.source === 'local' && !session.isInProgress && isCloudAvailable) {
         const uploadBtn = document.createElement('button');
         uploadBtn.textContent = 'Upload';
         styleActionButton(uploadBtn, '#ffe066', true);
