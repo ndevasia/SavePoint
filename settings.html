@@ -78,6 +78,13 @@
   <div class="settings-panel">
     <h2>Settings</h2>
     <div class="settings-row">
+      <input id="use-obs-recording" type="checkbox">
+      <label for="use-obs-recording" class="settings-copy">
+        <strong>Record with OBS instead of FFMPEG</strong>
+        <small>When enabled, sessions are recorded through OBS Studio's WebSocket server instead of the bundled FFMPEG binary. Requires OBS to be running with Tools &gt; WebSocket Server Settings enabled.</small>
+      </label>
+    </div>
+    <div class="settings-row">
       <input id="record-all-displays" type="checkbox">
       <label for="record-all-displays" class="settings-copy">
         <strong>Record both screens</strong>
@@ -178,6 +185,7 @@
 
   <script>
     const { ipcRenderer } = require('electron');
+    const useOBSRecordingCheckbox = document.getElementById('use-obs-recording');
     const recordAllDisplaysCheckbox = document.getElementById('record-all-displays');
     const localOnlyStorageCheckbox = document.getElementById('local-only-storage');
     const showRecentNotesOverlayCheckbox = document.getElementById('show-recent-notes-overlay');
@@ -233,11 +241,17 @@
     }
 
     function updateDisplayFieldState() {
-      const disabled = recordAllDisplaysCheckbox.checked || !displaySelect.options.length;
+      const usingOBS = useOBSRecordingCheckbox.checked;
+      const disabled = usingOBS || recordAllDisplaysCheckbox.checked || !displaySelect.options.length;
       displaySelect.disabled = disabled;
-      displayHelp.textContent = recordAllDisplaysCheckbox.checked
-        ? 'Disable multi-display capture to choose a specific monitor.'
-        : 'Choose which monitor should be recorded when multi-display capture is off.';
+      recordAllDisplaysCheckbox.disabled = usingOBS;
+      if (usingOBS) {
+        displayHelp.textContent = 'Display selection is managed inside OBS while OBS recording is enabled.';
+      } else {
+        displayHelp.textContent = recordAllDisplaysCheckbox.checked
+          ? 'Disable multi-display capture to choose a specific monitor.'
+          : 'Choose which monitor should be recorded when multi-display capture is off.';
+      }
     }
 
     async function loadSettings() {
@@ -248,6 +262,7 @@
         ]);
 
         recordAllDisplaysCheckbox.checked = settings.recordAllDisplays !== false;
+        useOBSRecordingCheckbox.checked = settings.recordingBackend === 'obs';
         localOnlyStorageCheckbox.checked = settings.localOnlyStorage === true;
         showRecentNotesOverlayCheckbox.checked = settings.showRecentNotesOverlay !== false;
         enablePostGameReviewCheckbox.checked = settings.enablePostGameReview === true;
@@ -278,6 +293,7 @@
     async function saveSettings() {
       const count = Math.max(1, Math.min(10, parseInt(recentNotesCountInput.value) || 3));
       await ipcRenderer.invoke('save-settings', {
+        recordingBackend: useOBSRecordingCheckbox.checked ? 'obs' : 'ffmpeg',
         recordAllDisplays: recordAllDisplaysCheckbox.checked,
         selectedDisplayId: displaySelect.value || null,
         localOnlyStorage: localOnlyStorageCheckbox.checked,
@@ -305,6 +321,12 @@
     }
 
     recordAllDisplaysCheckbox.addEventListener('change', updateDisplayFieldState);
+    useOBSRecordingCheckbox.addEventListener('change', () => {
+      updateDisplayFieldState();
+      if (useOBSRecordingCheckbox.checked) {
+        ipcRenderer.send('show-obs-reminder');
+      }
+    });
 
     loadSettings();
   </script>

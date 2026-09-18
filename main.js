@@ -2,6 +2,7 @@ const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen } = require(
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 const { spawnTracked, killAllChildren } = require("./backend/processManager.js");
+const { OBSWebSocket } = require('obs-websocket-js');
 const isDebug = process.argv.includes('--debug');
 const path = require('path');
 const AWSManager = require('./backend/aws.js');
@@ -36,11 +37,15 @@ let reviewWindow = null;
 let ffmpegProcess = null;
 let currentRecordingPath = null;
 let ffmpegExecutablePath = null;
-let ffmpegReady = false;
+let recordingReady = false;
+const obs = new OBSWebSocket();
+let isOBSConnected = false;
+let obsListenerAttached = false;
 let appConfig = {
   recordAllDisplays: true,
   selectedDisplayId: null,
   localOnlyStorage: false,
+  recordingBackend: 'ffmpeg', // 'ffmpeg' or 'obs'
   showRecentNotesOverlay: true,
   enablePostGameReview: false,
   recentNotesCount: 3,
@@ -234,7 +239,7 @@ async function listLocalSessions(username) {
       }
     }
 
-    const isActiveRecording = Boolean(ffmpegProcess) && fileTimestamp === sessionMetadata.getFileTimestamp();
+    const isActiveRecording = (Boolean(ffmpegProcess) || isOBSConnected) && fileTimestamp === sessionMetadata.getFileTimestamp();
 
     sessions.push({
       title: metadataObj.title || 'Session',
@@ -1125,6 +1130,199 @@ function stopFFMpegIfRunning() {
   }
 }
 
+function isOBSBackend() {
+  return appConfig.recordingBackend === 'obs';
+}
+
+function attachOBSRecordingListener() {
+  if (obsListenerAttached) return;
+  obs.on('RecordStateChanged', (data) => {
+    if (isDebug) {
+      console.log('OBS RecordStateChanged event:', data);
+    }
+  });
+  obsListenerAttached = true;
+}
+
+async function checkOBSAvailable() {
+  try {
+    await obs.connect();
+    isOBSConnected = true;
+    return { available: true, details: '' };
+  } catch (error) {
+    isOBSConnected = false;
+    return { available: false, details: error.message || String(error) };
+  }
+}
+
+function showOBSMissingDialog(details = '') {
+  const extraDetails = details ? `\n\nTechnical details:\n${details}` : '';
+  const choice = dialog.showMessageBoxSync({
+    type: 'error',
+    buttons: ['Quit App', 'Continue (Past Sessions Only)'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'OBS Not Found',
+    message: 'Could not connect to OBS via WebSocket.',
+    detail: `Make sure OBS Studio is running with the WebSocket server enabled (Tools > WebSocket Server Settings).${extraDetails}`,
+  });
+
+  return choice === 1;
+}
+
+async function connectOBS() {
+  if (isOBSConnected) {
+    return;
+  }
+  await obs.connect();
+  isOBSConnected = true;
+}
+
+async function startOBSRecording() {
+  await connectOBS();
+  const { outputActive } = await obs.call('GetRecordStatus');
+  if (!outputActive) {
+    await obs.call('StartRecord');
+  }
+  sessionMetadata.setVideoStartTimestamp(Date.now());
+  maybeWriteSessionMetadata();
+  console.log('OBS recording started');
+}
+
+async function stopOBSRecording(timeoutMs = 600000) {
+  return new Promise(async (resolve, reject) => {
+    let timeoutId;
+    let sizeInterval;
+
+    try {
+      const { outputActive } = await obs.call('GetRecordStatus');
+      if (!outputActive) {
+        console.log('No active OBS recording to stop.');
+        return resolve();
+      }
+
+      const onStopped = async (data) => {
+        if (data.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPING') {
+          clearInterval(sizeInterval);
+          sizeInterval = setInterval(() => {
+            try {
+              const stats = fs.statSync(data.outputPath);
+              console.log(`Writing file... ${Math.round(stats.size / (1024 * 1024))} MB`);
+            } catch (e) {
+              // file may not exist yet
+            }
+          }, 2000);
+        }
+
+        if (data.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPED') {
+          clearTimeout(timeoutId);
+          clearInterval(sizeInterval);
+          obs.off('RecordStateChanged', onStopped);
+
+          if (!data.outputPath) {
+            console.warn('OBS recording stopped but no file path was returned.');
+            return resolve();
+          }
+
+          try {
+            const username = sessionMetadata.getUsername();
+            const fileTimestamp = sessionMetadata.getFileTimestamp();
+            await ensureLocalSessionDirs(username);
+            await saveMetadataLocally();
+            await ensureLocalAnnotationsFile();
+
+            const localPaths = getLocalSessionPaths(username, fileTimestamp);
+            await fs.promises.copyFile(data.outputPath, localPaths.videoPath);
+            console.log(`OBS video saved locally: ${localPaths.videoPath}`);
+
+            if (shouldUploadToS3()) {
+              try {
+                const [videoBuffer, metadataBuffer, annotationsBuffer] = await Promise.all([
+                  fs.promises.readFile(localPaths.videoPath),
+                  fs.promises.readFile(localPaths.metadataPath),
+                  fs.promises.readFile(localPaths.annotationsPath),
+                ]);
+
+                await awsManager.uploadFile(videoBuffer, username, fileTimestamp, 'videos');
+                await awsManager.uploadFile(metadataBuffer, username, fileTimestamp, 'metadata');
+                await awsManager.uploadFile(annotationsBuffer, username, fileTimestamp, 'annotations');
+
+                await cleanupLocalSession(username, fileTimestamp);
+                console.log('Session uploaded to S3 and local copies removed.');
+              } catch (uploadError) {
+                console.warn('S3 upload failed. Keeping session locally for later upload.', uploadError);
+              }
+            }
+
+            try {
+              await fs.promises.unlink(data.outputPath);
+            } catch (e) {
+              console.warn('Could not delete OBS recording file:', e.message);
+            }
+          } catch (err) {
+            console.error('Failed during OBS save/upload process:', err);
+          }
+
+          resolve();
+        }
+      };
+
+      timeoutId = setTimeout(() => {
+        obs.off('RecordStateChanged', onStopped);
+        clearInterval(sizeInterval);
+        console.error(`Timed out waiting for OBS STOPPED event after ${timeoutMs}ms.`);
+        resolve();
+      }, timeoutMs);
+
+      obs.on('RecordStateChanged', onStopped);
+      await obs.call('StopRecord');
+    } catch (error) {
+      clearTimeout(timeoutId);
+      clearInterval(sizeInterval);
+      reject(error);
+    }
+  });
+}
+
+async function disconnectOBSIfNeeded() {
+  try {
+    if (isOBSConnected) {
+      await obs.disconnect();
+      isOBSConnected = false;
+    }
+  } catch (err) {
+    console.warn('Error disconnecting OBS:', err);
+  }
+}
+
+function stopOBSIfRunning() {
+  disconnectOBSIfNeeded().catch((err) => console.warn('Error stopping OBS:', err));
+}
+
+async function startRecording() {
+  if (isOBSBackend()) {
+    await startOBSRecording();
+  } else {
+    await startFFMpegRecording();
+  }
+}
+
+async function stopRecording(timeoutMs = 600000) {
+  if (isOBSBackend()) {
+    await stopOBSRecording(timeoutMs);
+  } else {
+    await stopFFMpegRecording(timeoutMs);
+  }
+}
+
+function stopRecordingIfRunning() {
+  if (isOBSBackend()) {
+    stopOBSIfRunning();
+  } else {
+    stopFFMpegIfRunning();
+  }
+}
+
 function reRegisterShortcuts() {
   if (shortcutsRegistered) {
     globalShortcut.unregisterAll();
@@ -1216,9 +1414,9 @@ function registerShortcuts() {
       } else {
         createLoadingWindow();
       }
-      await stopFFMpegRecording();
+      await stopRecording();
     } catch (err) {
-      console.error('Error during FFMPEG shutdown:', err);
+      console.error('Error during recording shutdown:', err);
     } finally {
       closeLoadingWindow();
     }
@@ -1244,14 +1442,15 @@ function registerShortcuts() {
 
 async function startSession() {
   console.log('➡ User starting session flow');
-  if (!ffmpegReady) {
+  if (!recordingReady) {
+    const backendName = isOBSBackend() ? 'OBS' : 'FFMPEG';
     dialog.showMessageBoxSync({
       type: 'warning',
       buttons: ['OK'],
       defaultId: 0,
       title: 'Recording Unavailable',
-      message: 'Cannot start a new session because FFMPEG is not available.',
-      detail: 'Install/configure FFMPEG and restart the app.',
+      message: `Cannot start a new session because ${backendName} is not available.`,
+      detail: `Configure ${backendName} and restart the app.`,
     });
     return;
   }
@@ -1264,7 +1463,7 @@ async function startSession() {
 
   registerShortcuts();
   createStartWindow();
-  await startFFMpegRecording();
+  await startRecording();
   createNoteWindow();        // open overlay window
   createEmojiWindow();
   
@@ -1336,21 +1535,37 @@ app.whenReady().then(async () => {
   awsManager = new AWSManager(sessionMetadata.getUsername());
   await awsManager.init();
 
-  const ffmpegCheck = checkFFMpegAvailable();
-  ffmpegReady = ffmpegCheck.available;
-  ffmpegExecutablePath = ffmpegCheck.path;
-  if (ffmpegReady) {
-    console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
-  } else {
-    console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
-    if (ffmpegCheck.details) {
-      console.error(`FFMPEG details: ${ffmpegCheck.details}`);
+  if (isOBSBackend()) {
+    attachOBSRecordingListener();
+    const obsCheck = await checkOBSAvailable();
+    recordingReady = obsCheck.available;
+    if (recordingReady) {
+      console.log('OBS WebSocket connection verified');
+    } else {
+      console.error(`OBS check failed: ${obsCheck.details}`);
+      const continueWithoutRecording = showOBSMissingDialog(obsCheck.details);
+      if (!continueWithoutRecording) {
+        app.quit();
+        return;
+      }
     }
+  } else {
+    const ffmpegCheck = checkFFMpegAvailable();
+    recordingReady = ffmpegCheck.available;
+    ffmpegExecutablePath = ffmpegCheck.path;
+    if (recordingReady) {
+      console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
+    } else {
+      console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
+      if (ffmpegCheck.details) {
+        console.error(`FFMPEG details: ${ffmpegCheck.details}`);
+      }
 
-    const continueWithoutRecording = showFFMpegMissingDialog(ffmpegCheck.details);
-    if (!continueWithoutRecording) {
-      app.quit();
-      return;
+      const continueWithoutRecording = showFFMpegMissingDialog(ffmpegCheck.details);
+      if (!continueWithoutRecording) {
+        app.quit();
+        return;
+      }
     }
   }
 
@@ -1403,6 +1618,15 @@ app.whenReady().then(async () => {
     if (settingsWindow) {
       settingsWindow.close();
     }
+  });
+  ipcMain.on('show-obs-reminder', () => {
+    dialog.showMessageBox(settingsWindow || undefined, {
+      type: 'info',
+      buttons: ['OK'],
+      title: 'OBS Recording Enabled',
+      message: 'Remember to open OBS before starting a session.',
+      detail: 'Make sure OBS Studio is running with the WebSocket server enabled (Tools > WebSocket Server Settings) before you start recording.',
+    });
   });
   ipcMain.on('open-home', async () => {
   if (mainWindow && mainWindow.isVisible()) {
@@ -1557,7 +1781,7 @@ app.whenReady().then(async () => {
   }
 
   app.on('will-quit', () => {
-    stopFFMpegIfRunning();
+    stopRecordingIfRunning();
     globalShortcut.unregisterAll();
   });
 
