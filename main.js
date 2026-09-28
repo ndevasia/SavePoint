@@ -2,6 +2,7 @@ const { app, BrowserWindow, globalShortcut, ipcMain, dialog, screen } = require(
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 const { spawnTracked, killAllChildren } = require("./backend/processManager.js");
+const { OBSWebSocket } = require('obs-websocket-js');
 const isDebug = process.argv.includes('--debug');
 const path = require('path');
 const AWSManager = require('./backend/aws.js');
@@ -36,11 +37,17 @@ let reviewWindow = null;
 let ffmpegProcess = null;
 let currentRecordingPath = null;
 let ffmpegExecutablePath = null;
-let ffmpegReady = false;
+let recordingReady = false;
+const obs = new OBSWebSocket();
+let isOBSConnected = false;
+let obsListenerAttached = false;
 let appConfig = {
   recordAllDisplays: true,
   selectedDisplayId: null,
   localOnlyStorage: false,
+  recordingBackend: 'ffmpeg', // 'ffmpeg' or 'obs'
+  captureAudio: false,
+  selectedAudioDeviceId: null,
   showRecentNotesOverlay: true,
   enablePostGameReview: false,
   recentNotesCount: 3,
@@ -234,7 +241,7 @@ async function listLocalSessions(username) {
       }
     }
 
-    const isActiveRecording = Boolean(ffmpegProcess) && fileTimestamp === sessionMetadata.getFileTimestamp();
+    const isActiveRecording = (Boolean(ffmpegProcess) || isOBSConnected) && fileTimestamp === sessionMetadata.getFileTimestamp();
 
     sessions.push({
       title: metadataObj.title || 'Session',
@@ -829,29 +836,171 @@ function showFFMpegMissingDialog(details = '') {
   return choice === 1;
 }
 
-function parseMacCaptureDevice(ffmpegPath) {
-  const ffmpegResult = spawnSync(
-    ffmpegPath,
-    ['-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '""'],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+const DEVICE_LIST_TIMEOUT_MS = 5000;
 
-  const lines = ffmpegResult.stderr.toString().split('\n');
-  const screenLine = lines.find((line) => {
-    const lower = line.toLowerCase();
-    return lower.includes('capture screen') || lower.includes('screen');
+// FFMPEG prints device listings to stderr and then exits non-zero, so the exit
+// status is not a useful signal here -- only the stderr text matters.
+function runDeviceListing(command, args) {
+  const result = spawnSync(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: DEVICE_LIST_TIMEOUT_MS,
+    windowsHide: true,
   });
 
-  if (!screenLine) {
-    return '1:none';
+  if (result.error) {
+    throw result.error;
   }
 
-  const match = screenLine.match(/\[(\d+)\]/);
-  if (!match) {
-    return '1:none';
+  return {
+    stdout: result.stdout ? result.stdout.toString() : '',
+    stderr: result.stderr ? result.stderr.toString() : '',
+    status: result.status,
+  };
+}
+
+// Parses `-f dshow -list_devices true`. Handles both the modern layout, where
+// each device line is tagged `(audio)`/`(video)`, and the older layout that
+// groups devices under "DirectShow audio devices" headers.
+function parseDShowDevices(ffmpegPath) {
+  const { stderr } = runDeviceListing(ffmpegPath, [
+    '-hide_banner', '-f', 'dshow', '-list_devices', 'true', '-i', 'dummy',
+  ]);
+
+  const devices = [];
+  let section = null;
+
+  stderr.split('\n').forEach((rawLine) => {
+    const line = rawLine.replace(/^\[dshow @ [^\]]*\]\s*/, '').trim();
+
+    if (/DirectShow video devices/i.test(line)) {
+      section = 'video';
+      return;
+    }
+    if (/DirectShow audio devices/i.test(line)) {
+      section = 'audio';
+      return;
+    }
+
+    // "Alternative name" always belongs to the device listed just above it.
+    const altMatch = line.match(/^Alternative name\s+"(.+)"$/i);
+    if (altMatch && devices.length) {
+      devices[devices.length - 1].altName = altMatch[1];
+      return;
+    }
+
+    const nameMatch = line.match(/^"(.+?)"(?:\s+\((audio|video)\))?$/i);
+    if (!nameMatch) {
+      return;
+    }
+
+    // Video devices are collected too, so that a following "Alternative name"
+    // line is not misattributed to the previous audio device. Filtered below.
+    devices.push({
+      id: nameMatch[1],
+      label: nameMatch[1],
+      altName: null,
+      kind: nameMatch[2] ? nameMatch[2].toLowerCase() : section,
+    });
+  });
+
+  return devices.filter((device) => device.kind === 'audio');
+}
+
+function parseAVFoundationDevices(ffmpegPath) {
+  const { stderr } = runDeviceListing(ffmpegPath, [
+    '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '""',
+  ]);
+
+  const videoDevices = [];
+  const audioDevices = [];
+  let section = null;
+
+  stderr.split('\n').forEach((rawLine) => {
+    const line = rawLine.replace(/^\[AVFoundation[^\]]*\]\s*/, '').trim();
+
+    if (/AVFoundation video devices/i.test(line)) {
+      section = 'video';
+      return;
+    }
+    if (/AVFoundation audio devices/i.test(line)) {
+      section = 'audio';
+      return;
+    }
+
+    const match = line.match(/^\[(\d+)\]\s+(.*)$/);
+    if (!match || !section) {
+      return;
+    }
+
+    const device = { id: match[1], label: match[2].trim() };
+    (section === 'video' ? videoDevices : audioDevices).push(device);
+  });
+
+  return { videoDevices, audioDevices };
+}
+
+// FFMPEG cannot enumerate PulseAudio sources, so ask PulseAudio directly.
+function parsePulseSources() {
+  const defaultSource = { id: 'default', label: 'Default system source' };
+
+  let listing;
+  try {
+    listing = runDeviceListing('pactl', ['list', 'short', 'sources']);
+  } catch {
+    return [defaultSource];
   }
 
-  return `${match[1]}:none`;
+  if (listing.status !== 0) {
+    return [defaultSource];
+  }
+
+  const sources = listing.stdout
+    .split('\n')
+    .map((line) => line.split('\t')[1])
+    .filter(Boolean)
+    .map((name) => ({ id: name, label: name }));
+
+  return [defaultSource, ...sources];
+}
+
+function listAudioCaptureDevices(ffmpegPath) {
+  const resolvedPath = ffmpegPath || ffmpegExecutablePath || resolveFFMpegPath();
+
+  try {
+    if (process.platform === 'win32') {
+      return parseDShowDevices(resolvedPath);
+    }
+    if (process.platform === 'darwin') {
+      return parseAVFoundationDevices(resolvedPath).audioDevices;
+    }
+    return parsePulseSources();
+  } catch (err) {
+    console.warn('Could not enumerate audio capture devices:', err.message);
+    return [];
+  }
+}
+
+function resolveAudioCaptureDevice(ffmpegPath) {
+  const devices = listAudioCaptureDevices(ffmpegPath);
+  if (!devices.length) {
+    return null;
+  }
+
+  const configuredId = appConfig.selectedAudioDeviceId;
+  const configured = configuredId
+    ? devices.find((device) => String(device.id) === String(configuredId))
+    : null;
+
+  if (configuredId && !configured) {
+    console.warn(`Configured audio device "${configuredId}" was not found; falling back to "${devices[0].label}".`);
+  }
+
+  return configured || devices[0];
+}
+
+function findMacScreenDeviceIndex(videoDevices) {
+  const screenDevice = videoDevices.find((device) => device.label.toLowerCase().includes('screen'));
+  return screenDevice ? screenDevice.id : '1';
 }
 
 function getDisplayCaptureConfig() {
@@ -884,14 +1033,24 @@ function getDisplayCaptureConfig() {
   };
 }
 
-function getFFMpegRecordingArgs(ffmpegPath, outputPath) {
+function getFFMpegRecordingArgs(ffmpegPath, outputPath, { includeAudio = false } = {}) {
   const args = ['-hide_banner', '-y'];
+  const audioDevice = includeAudio ? resolveAudioCaptureDevice(ffmpegPath) : null;
+
+  if (includeAudio && !audioDevice) {
+    console.warn('Audio capture is enabled but no capture device was found; recording video only.');
+  }
+
+  // gdigrab/x11grab cannot capture audio, so audio arrives as a second input
+  // that has to be mapped explicitly. avfoundation takes both in one input.
+  let hasSeparateAudioInput = false;
 
   if (process.platform === 'win32') {
     const captureConfig = getDisplayCaptureConfig();
     args.push(
       '-f', 'gdigrab',
       '-framerate', '30',
+      '-thread_queue_size', '1024',
     );
 
     if (captureConfig.offsetX !== null && captureConfig.offsetY !== null && captureConfig.size) {
@@ -905,27 +1064,60 @@ function getFFMpegRecordingArgs(ffmpegPath, outputPath) {
     args.push(
       '-i', captureConfig.input
     );
+
+    if (audioDevice) {
+      args.push(
+        '-f', 'dshow',
+        '-thread_queue_size', '1024',
+        '-i', `audio=${audioDevice.altName || audioDevice.id}`
+      );
+      hasSeparateAudioInput = true;
+    }
   } else if (process.platform === 'darwin') {
-    const captureDevice = parseMacCaptureDevice(ffmpegPath);
+    const { videoDevices } = parseAVFoundationDevices(ffmpegPath);
+    const screenIndex = findMacScreenDeviceIndex(videoDevices);
     args.push(
       '-f', 'avfoundation',
       '-framerate', '30',
-      '-i', captureDevice
+      '-i', `${screenIndex}:${audioDevice ? audioDevice.id : 'none'}`
     );
   } else {
     args.push(
       '-f', 'x11grab',
       '-framerate', '30',
+      '-thread_queue_size', '1024',
       '-i', process.env.DISPLAY || ':0.0'
     );
+
+    if (audioDevice) {
+      args.push(
+        '-f', 'pulse',
+        '-thread_queue_size', '1024',
+        '-i', audioDevice.id
+      );
+      hasSeparateAudioInput = true;
+    }
+  }
+
+  if (hasSeparateAudioInput) {
+    args.push('-map', '0:v', '-map', '1:a');
   }
 
   args.push(
     '-c:v', 'libx264',
     '-preset', 'veryfast',
-    '-pix_fmt', 'yuv420p',
-    outputPath
+    '-pix_fmt', 'yuv420p'
   );
+
+  if (audioDevice) {
+    console.log(`Capturing audio from: ${audioDevice.label}`);
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', '160k'
+    );
+  }
+
+  args.push(outputPath);
 
   return args;
 }
@@ -941,7 +1133,27 @@ async function startFFMpegRecording() {
 
   const ffmpegPath = ffmpegExecutablePath || resolveFFMpegPath();
   currentRecordingPath = path.join(recordingsDir, `recording_${Date.now()}.mp4`);
-  const args = getFFMpegRecordingArgs(ffmpegPath, currentRecordingPath);
+  const wantsAudio = appConfig.captureAudio === true;
+
+  try {
+    await spawnFFMpegRecording(ffmpegPath, currentRecordingPath, { includeAudio: wantsAudio });
+  } catch (err) {
+    if (!wantsAudio) {
+      throw err;
+    }
+    // A missing/busy capture device makes FFMPEG exit at startup. Losing the
+    // whole session over that is worse than losing the audio track.
+    console.warn(`FFMPEG could not start with audio capture (${err.message}); retrying without audio.`);
+    await spawnFFMpegRecording(ffmpegPath, currentRecordingPath, { includeAudio: false });
+  }
+
+  sessionMetadata.setVideoStartTimestamp(Date.now());
+  maybeWriteSessionMetadata();
+  console.log('FFMPEG recording started');
+}
+
+async function spawnFFMpegRecording(ffmpegPath, outputPath, { includeAudio }) {
+  const args = getFFMpegRecordingArgs(ffmpegPath, outputPath, { includeAudio });
 
   console.log('Starting FFMPEG recording');
   if (isDebug) {
@@ -990,10 +1202,6 @@ async function startFFMpegRecording() {
       }
     });
   });
-
-  sessionMetadata.setVideoStartTimestamp(Date.now());
-  maybeWriteSessionMetadata();
-  console.log('FFMPEG recording started');
 }
 
 
@@ -1125,6 +1333,199 @@ function stopFFMpegIfRunning() {
   }
 }
 
+function isOBSBackend() {
+  return appConfig.recordingBackend === 'obs';
+}
+
+function attachOBSRecordingListener() {
+  if (obsListenerAttached) return;
+  obs.on('RecordStateChanged', (data) => {
+    if (isDebug) {
+      console.log('OBS RecordStateChanged event:', data);
+    }
+  });
+  obsListenerAttached = true;
+}
+
+async function checkOBSAvailable() {
+  try {
+    await obs.connect();
+    isOBSConnected = true;
+    return { available: true, details: '' };
+  } catch (error) {
+    isOBSConnected = false;
+    return { available: false, details: error.message || String(error) };
+  }
+}
+
+function showOBSMissingDialog(details = '') {
+  const extraDetails = details ? `\n\nTechnical details:\n${details}` : '';
+  const choice = dialog.showMessageBoxSync({
+    type: 'error',
+    buttons: ['Quit App', 'Continue (Past Sessions Only)'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'OBS Not Found',
+    message: 'Could not connect to OBS via WebSocket.',
+    detail: `Make sure OBS Studio is running with the WebSocket server enabled (Tools > WebSocket Server Settings).${extraDetails}`,
+  });
+
+  return choice === 1;
+}
+
+async function connectOBS() {
+  if (isOBSConnected) {
+    return;
+  }
+  await obs.connect();
+  isOBSConnected = true;
+}
+
+async function startOBSRecording() {
+  await connectOBS();
+  const { outputActive } = await obs.call('GetRecordStatus');
+  if (!outputActive) {
+    await obs.call('StartRecord');
+  }
+  sessionMetadata.setVideoStartTimestamp(Date.now());
+  maybeWriteSessionMetadata();
+  console.log('OBS recording started');
+}
+
+async function stopOBSRecording(timeoutMs = 600000) {
+  return new Promise(async (resolve, reject) => {
+    let timeoutId;
+    let sizeInterval;
+
+    try {
+      const { outputActive } = await obs.call('GetRecordStatus');
+      if (!outputActive) {
+        console.log('No active OBS recording to stop.');
+        return resolve();
+      }
+
+      const onStopped = async (data) => {
+        if (data.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPING') {
+          clearInterval(sizeInterval);
+          sizeInterval = setInterval(() => {
+            try {
+              const stats = fs.statSync(data.outputPath);
+              console.log(`Writing file... ${Math.round(stats.size / (1024 * 1024))} MB`);
+            } catch (e) {
+              // file may not exist yet
+            }
+          }, 2000);
+        }
+
+        if (data.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPED') {
+          clearTimeout(timeoutId);
+          clearInterval(sizeInterval);
+          obs.off('RecordStateChanged', onStopped);
+
+          if (!data.outputPath) {
+            console.warn('OBS recording stopped but no file path was returned.');
+            return resolve();
+          }
+
+          try {
+            const username = sessionMetadata.getUsername();
+            const fileTimestamp = sessionMetadata.getFileTimestamp();
+            await ensureLocalSessionDirs(username);
+            await saveMetadataLocally();
+            await ensureLocalAnnotationsFile();
+
+            const localPaths = getLocalSessionPaths(username, fileTimestamp);
+            await fs.promises.copyFile(data.outputPath, localPaths.videoPath);
+            console.log(`OBS video saved locally: ${localPaths.videoPath}`);
+
+            if (shouldUploadToS3()) {
+              try {
+                const [videoBuffer, metadataBuffer, annotationsBuffer] = await Promise.all([
+                  fs.promises.readFile(localPaths.videoPath),
+                  fs.promises.readFile(localPaths.metadataPath),
+                  fs.promises.readFile(localPaths.annotationsPath),
+                ]);
+
+                await awsManager.uploadFile(videoBuffer, username, fileTimestamp, 'videos');
+                await awsManager.uploadFile(metadataBuffer, username, fileTimestamp, 'metadata');
+                await awsManager.uploadFile(annotationsBuffer, username, fileTimestamp, 'annotations');
+
+                await cleanupLocalSession(username, fileTimestamp);
+                console.log('Session uploaded to S3 and local copies removed.');
+              } catch (uploadError) {
+                console.warn('S3 upload failed. Keeping session locally for later upload.', uploadError);
+              }
+            }
+
+            try {
+              await fs.promises.unlink(data.outputPath);
+            } catch (e) {
+              console.warn('Could not delete OBS recording file:', e.message);
+            }
+          } catch (err) {
+            console.error('Failed during OBS save/upload process:', err);
+          }
+
+          resolve();
+        }
+      };
+
+      timeoutId = setTimeout(() => {
+        obs.off('RecordStateChanged', onStopped);
+        clearInterval(sizeInterval);
+        console.error(`Timed out waiting for OBS STOPPED event after ${timeoutMs}ms.`);
+        resolve();
+      }, timeoutMs);
+
+      obs.on('RecordStateChanged', onStopped);
+      await obs.call('StopRecord');
+    } catch (error) {
+      clearTimeout(timeoutId);
+      clearInterval(sizeInterval);
+      reject(error);
+    }
+  });
+}
+
+async function disconnectOBSIfNeeded() {
+  try {
+    if (isOBSConnected) {
+      await obs.disconnect();
+      isOBSConnected = false;
+    }
+  } catch (err) {
+    console.warn('Error disconnecting OBS:', err);
+  }
+}
+
+function stopOBSIfRunning() {
+  disconnectOBSIfNeeded().catch((err) => console.warn('Error stopping OBS:', err));
+}
+
+async function startRecording() {
+  if (isOBSBackend()) {
+    await startOBSRecording();
+  } else {
+    await startFFMpegRecording();
+  }
+}
+
+async function stopRecording(timeoutMs = 600000) {
+  if (isOBSBackend()) {
+    await stopOBSRecording(timeoutMs);
+  } else {
+    await stopFFMpegRecording(timeoutMs);
+  }
+}
+
+function stopRecordingIfRunning() {
+  if (isOBSBackend()) {
+    stopOBSIfRunning();
+  } else {
+    stopFFMpegIfRunning();
+  }
+}
+
 function reRegisterShortcuts() {
   if (shortcutsRegistered) {
     globalShortcut.unregisterAll();
@@ -1216,9 +1617,9 @@ function registerShortcuts() {
       } else {
         createLoadingWindow();
       }
-      await stopFFMpegRecording();
+      await stopRecording();
     } catch (err) {
-      console.error('Error during FFMPEG shutdown:', err);
+      console.error('Error during recording shutdown:', err);
     } finally {
       closeLoadingWindow();
     }
@@ -1244,14 +1645,15 @@ function registerShortcuts() {
 
 async function startSession() {
   console.log('➡ User starting session flow');
-  if (!ffmpegReady) {
+  if (!recordingReady) {
+    const backendName = isOBSBackend() ? 'OBS' : 'FFMPEG';
     dialog.showMessageBoxSync({
       type: 'warning',
       buttons: ['OK'],
       defaultId: 0,
       title: 'Recording Unavailable',
-      message: 'Cannot start a new session because FFMPEG is not available.',
-      detail: 'Install/configure FFMPEG and restart the app.',
+      message: `Cannot start a new session because ${backendName} is not available.`,
+      detail: `Configure ${backendName} and restart the app.`,
     });
     return;
   }
@@ -1264,7 +1666,7 @@ async function startSession() {
 
   registerShortcuts();
   createStartWindow();
-  await startFFMpegRecording();
+  await startRecording();
   createNoteWindow();        // open overlay window
   createEmojiWindow();
   
@@ -1336,21 +1738,37 @@ app.whenReady().then(async () => {
   awsManager = new AWSManager(sessionMetadata.getUsername());
   await awsManager.init();
 
-  const ffmpegCheck = checkFFMpegAvailable();
-  ffmpegReady = ffmpegCheck.available;
-  ffmpegExecutablePath = ffmpegCheck.path;
-  if (ffmpegReady) {
-    console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
-  } else {
-    console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
-    if (ffmpegCheck.details) {
-      console.error(`FFMPEG details: ${ffmpegCheck.details}`);
+  if (isOBSBackend()) {
+    attachOBSRecordingListener();
+    const obsCheck = await checkOBSAvailable();
+    recordingReady = obsCheck.available;
+    if (recordingReady) {
+      console.log('OBS WebSocket connection verified');
+    } else {
+      console.error(`OBS check failed: ${obsCheck.details}`);
+      const continueWithoutRecording = showOBSMissingDialog(obsCheck.details);
+      if (!continueWithoutRecording) {
+        app.quit();
+        return;
+      }
     }
+  } else {
+    const ffmpegCheck = checkFFMpegAvailable();
+    recordingReady = ffmpegCheck.available;
+    ffmpegExecutablePath = ffmpegCheck.path;
+    if (recordingReady) {
+      console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
+    } else {
+      console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
+      if (ffmpegCheck.details) {
+        console.error(`FFMPEG details: ${ffmpegCheck.details}`);
+      }
 
-    const continueWithoutRecording = showFFMpegMissingDialog(ffmpegCheck.details);
-    if (!continueWithoutRecording) {
-      app.quit();
-      return;
+      const continueWithoutRecording = showFFMpegMissingDialog(ffmpegCheck.details);
+      if (!continueWithoutRecording) {
+        app.quit();
+        return;
+      }
     }
   }
 
@@ -1404,6 +1822,15 @@ app.whenReady().then(async () => {
       settingsWindow.close();
     }
   });
+  ipcMain.on('show-obs-reminder', () => {
+    dialog.showMessageBox(settingsWindow || undefined, {
+      type: 'info',
+      buttons: ['OK'],
+      title: 'OBS Recording Enabled',
+      message: 'Remember to open OBS before starting a session.',
+      detail: 'Make sure OBS Studio is running with the WebSocket server enabled (Tools > WebSocket Server Settings) before you start recording.',
+    });
+  });
   ipcMain.on('open-home', async () => {
   if (mainWindow && mainWindow.isVisible()) {
     isReturningHome = true; 
@@ -1427,6 +1854,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('get-available-displays', () => {
     return getAvailableDisplays();
+  });
+  ipcMain.handle('get-available-audio-devices', () => {
+    return listAudioCaptureDevices().map((device) => ({
+      id: String(device.id),
+      label: device.label,
+    }));
   });
   ipcMain.handle('save-settings', async (event, settings) => {
     await saveSettings(settings);
@@ -1557,7 +1990,7 @@ app.whenReady().then(async () => {
   }
 
   app.on('will-quit', () => {
-    stopFFMpegIfRunning();
+    stopRecordingIfRunning();
     globalShortcut.unregisterAll();
   });
 

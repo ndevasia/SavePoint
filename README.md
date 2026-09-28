@@ -4,7 +4,7 @@ This tool allows players to create and store notes taken during their gameplay s
 
 ## Getting Started
 
-[NOTE: If you know Nisha personally, you can skip all of the following steps and send her an email asking for a build. This will save you a lot of work.]
+[NOTE: If you know Nisha personally, you can skip all of the following steps and send her an email asking for a build to test the app out. If you want to run your own study, you'll need to follow all the steps below for data collection purposes. Please do not use Nisha's test build to run your studies.]
 
 To get the tool running locally, follow these steps:
 
@@ -32,7 +32,7 @@ AWS_ACCESS_KEY_ID=[enter your own]
 AWS_SECRET_ACCESS_KEY=[enter your own]
 AWS_REGION=us-west-2
 AWS_BUCKET_NAME=game-annotator
-AWS_ROLE_ARN=arn:aws:iam::378382627972:role/gameannotator
+AWS_ROLE_ARN=arn:aws:iam::[YOUR AWS ACCOUNT ID]:role/gameannotator
 ```
 
 ---
@@ -80,7 +80,7 @@ The role must trust your IAM user to allow the `sts:AssumeRole` action. Update t
         {
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::378382627972:user/gameannotator-user"
+                "AWS": "arn:aws:iam::[YOUR AWS ACCOUNT ID]:user/gameannotator-user"
             },
             "Action": "sts:AssumeRole"
         }

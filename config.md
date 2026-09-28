@@ -18,6 +18,18 @@ Record both screens
 - On: the recorder captures the full desktop area across your displays.
 - Off: the recorder captures only one monitor. You can select this monitor through the dropdown.
 
+Record audio
+- On: FFMPEG records an audio track alongside the screen, encoded as AAC.
+- Off: recordings are video-only (the previous behavior).
+- Note: this setting applies to the FFMPEG backend only. When recording through OBS, audio sources are configured inside OBS itself.
+- On Windows, gdigrab cannot capture sound, so audio comes from a DirectShow device. A microphone works out of the box; capturing game/desktop sound needs a loopback device such as Stereo Mix (if your sound card exposes it) or a virtual cable like VB-Cable.
+- If the selected device cannot be opened when recording starts, the session falls back to video-only rather than failing.
+
+Audio input device
+- Selects which capture device supplies the audio track.
+- The list is enumerated from DirectShow on Windows, AVFoundation on macOS, and PulseAudio on Linux.
+- If the saved device is missing at record time, the first available device is used instead.
+
 Use local-only storage
 - On: session video, metadata, and notes stay on your machine and are not auto-uploaded to the configured database.
 - Off: after recording stops, the app attempts to upload session files to the database (S3 as originally configured).

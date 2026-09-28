@@ -78,6 +78,13 @@
   <div class="settings-panel">
     <h2>Settings</h2>
     <div class="settings-row">
+      <input id="use-obs-recording" type="checkbox">
+      <label for="use-obs-recording" class="settings-copy">
+        <strong>Record with OBS instead of FFMPEG</strong>
+        <small>When enabled, sessions are recorded through OBS Studio's WebSocket server instead of the bundled FFMPEG binary. Requires OBS to be running with Tools &gt; WebSocket Server Settings enabled.</small>
+      </label>
+    </div>
+    <div class="settings-row">
       <input id="record-all-displays" type="checkbox">
       <label for="record-all-displays" class="settings-copy">
         <strong>Record both screens</strong>
@@ -88,6 +95,18 @@
       <label for="display-select"><strong>Monitor to record</strong></label>
       <select id="display-select"></select>
       <small id="display-help">Choose which monitor should be recorded when multi-display capture is off.</small>
+    </div>
+    <div class="settings-row">
+      <input id="capture-audio" type="checkbox">
+      <label for="capture-audio" class="settings-copy">
+        <strong>Record audio</strong>
+        <small>When enabled, FFMPEG records an audio track alongside the screen. On Windows, capturing game/desktop sound (rather than just a microphone) requires a loopback device such as Stereo Mix or VB-Cable.</small>
+      </label>
+    </div>
+    <div class="settings-field">
+      <label for="audio-device-select"><strong>Audio input device</strong></label>
+      <select id="audio-device-select"></select>
+      <small id="audio-help">Choose which capture device supplies the audio track.</small>
     </div>
     <div class="settings-row">
       <input id="local-only-storage" type="checkbox">
@@ -178,6 +197,7 @@
 
   <script>
     const { ipcRenderer } = require('electron');
+    const useOBSRecordingCheckbox = document.getElementById('use-obs-recording');
     const recordAllDisplaysCheckbox = document.getElementById('record-all-displays');
     const localOnlyStorageCheckbox = document.getElementById('local-only-storage');
     const showRecentNotesOverlayCheckbox = document.getElementById('show-recent-notes-overlay');
@@ -185,6 +205,9 @@
     const recentNotesCountInput = document.getElementById('recent-notes-count');
     const displaySelect = document.getElementById('display-select');
     const displayHelp = document.getElementById('display-help');
+    const captureAudioCheckbox = document.getElementById('capture-audio');
+    const audioDeviceSelect = document.getElementById('audio-device-select');
+    const audioHelp = document.getElementById('audio-help');
 
     // Hotkey input elements
     const hotkeyInputs = {
@@ -232,28 +255,79 @@
       displaySelect.disabled = true;
     }
 
+    function renderAudioDeviceOptions(devices, selectedAudioDeviceId) {
+      audioDeviceSelect.innerHTML = '';
+
+      if (!devices.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No audio capture devices detected';
+        audioDeviceSelect.appendChild(option);
+        return;
+      }
+
+      devices.forEach((device) => {
+        const option = document.createElement('option');
+        option.value = device.id;
+        option.textContent = device.label;
+        audioDeviceSelect.appendChild(option);
+      });
+
+      const matchingDevice = devices.find((device) => String(device.id) === String(selectedAudioDeviceId));
+      audioDeviceSelect.value = matchingDevice ? matchingDevice.id : devices[0].id;
+    }
+
+    function updateAudioFieldState() {
+      const usingOBS = useOBSRecordingCheckbox.checked;
+      const hasDevices = Boolean(audioDeviceSelect.value);
+
+      captureAudioCheckbox.disabled = usingOBS;
+      audioDeviceSelect.disabled = usingOBS || !captureAudioCheckbox.checked || !hasDevices;
+
+      if (usingOBS) {
+        audioHelp.textContent = 'Audio capture is managed inside OBS while OBS recording is enabled.';
+      } else if (!hasDevices) {
+        audioHelp.textContent = 'No audio capture devices were detected. On Windows, enable Stereo Mix or install a loopback driver to record desktop sound.';
+      } else if (!captureAudioCheckbox.checked) {
+        audioHelp.textContent = 'Enable audio recording to choose a capture device.';
+      } else {
+        audioHelp.textContent = 'Choose which capture device supplies the audio track.';
+      }
+    }
+
     function updateDisplayFieldState() {
-      const disabled = recordAllDisplaysCheckbox.checked || !displaySelect.options.length;
+      const usingOBS = useOBSRecordingCheckbox.checked;
+      const disabled = usingOBS || recordAllDisplaysCheckbox.checked || !displaySelect.options.length;
       displaySelect.disabled = disabled;
-      displayHelp.textContent = recordAllDisplaysCheckbox.checked
-        ? 'Disable multi-display capture to choose a specific monitor.'
-        : 'Choose which monitor should be recorded when multi-display capture is off.';
+      recordAllDisplaysCheckbox.disabled = usingOBS;
+      if (usingOBS) {
+        displayHelp.textContent = 'Display selection is managed inside OBS while OBS recording is enabled.';
+      } else {
+        displayHelp.textContent = recordAllDisplaysCheckbox.checked
+          ? 'Disable multi-display capture to choose a specific monitor.'
+          : 'Choose which monitor should be recorded when multi-display capture is off.';
+      }
     }
 
     async function loadSettings() {
       try {
-        const [settings, displays] = await Promise.all([
+        const [settings, displays, audioDevices] = await Promise.all([
           ipcRenderer.invoke('get-settings'),
           ipcRenderer.invoke('get-available-displays'),
+          ipcRenderer.invoke('get-available-audio-devices'),
         ]);
 
         recordAllDisplaysCheckbox.checked = settings.recordAllDisplays !== false;
+        useOBSRecordingCheckbox.checked = settings.recordingBackend === 'obs';
         localOnlyStorageCheckbox.checked = settings.localOnlyStorage === true;
         showRecentNotesOverlayCheckbox.checked = settings.showRecentNotesOverlay !== false;
         enablePostGameReviewCheckbox.checked = settings.enablePostGameReview === true;
         recentNotesCountInput.value = settings.recentNotesCount || 3;
+        captureAudioCheckbox.checked = settings.captureAudio === true;
         renderDisplayOptions(displays, settings.selectedDisplayId);
+        renderAudioDeviceOptions(audioDevices, settings.selectedAudioDeviceId);
         updateDisplayFieldState();
+        updateAudioFieldState();
 
         // Load hotkey settings
         if (settings.hotkeys) {
@@ -271,15 +345,20 @@
       } catch (error) {
         console.error('Failed to load display settings:', error);
         renderDisplayError('Unable to load displays');
+        renderAudioDeviceOptions([], null);
         updateDisplayFieldState();
+        updateAudioFieldState();
       }
     }
 
     async function saveSettings() {
       const count = Math.max(1, Math.min(10, parseInt(recentNotesCountInput.value) || 3));
       await ipcRenderer.invoke('save-settings', {
+        recordingBackend: useOBSRecordingCheckbox.checked ? 'obs' : 'ffmpeg',
         recordAllDisplays: recordAllDisplaysCheckbox.checked,
         selectedDisplayId: displaySelect.value || null,
+        captureAudio: captureAudioCheckbox.checked,
+        selectedAudioDeviceId: audioDeviceSelect.value || null,
         localOnlyStorage: localOnlyStorageCheckbox.checked,
         showRecentNotesOverlay: showRecentNotesOverlayCheckbox.checked,
         enablePostGameReview: enablePostGameReviewCheckbox.checked,
@@ -305,6 +384,14 @@
     }
 
     recordAllDisplaysCheckbox.addEventListener('change', updateDisplayFieldState);
+    captureAudioCheckbox.addEventListener('change', updateAudioFieldState);
+    useOBSRecordingCheckbox.addEventListener('change', () => {
+      updateDisplayFieldState();
+      updateAudioFieldState();
+      if (useOBSRecordingCheckbox.checked) {
+        ipcRenderer.send('show-obs-reminder');
+      }
+    });
 
     loadSettings();
   </script>
