@@ -18,75 +18,28 @@ To get the tool running locally, follow these steps:
    npm run start
    ```
 
----
-
-## Configuration
-
-The application requires specific environment variables to interact with AWS. Because the `.env` file is excluded from the repository for security, you must create one manually in the root directory.
-
-### `.env` Template
-Create a file named `.env` and populate it with your credentials:
-
-```env
-AWS_ACCESS_KEY_ID=[enter your own]
-AWS_SECRET_ACCESS_KEY=[enter your own]
-AWS_REGION=us-west-2
-AWS_BUCKET_NAME=game-annotator
-AWS_ROLE_ARN=arn:aws:iam::[YOUR AWS ACCOUNT ID]:role/gameannotator
-```
+If you don't know what npm is, you may need to follow the more detailed instructions [here](docs/build-the-app.md).
 
 ---
 
-## AWS IAM Setup
+## Documentation
 
-To successfully authenticate, you will need to create an **IAM User** and an **IAM Role** with the following configurations.
+### Running a study
 
-### 1. Role Policy
-Attach this policy to your role to allow the application to list and manage objects in the S3 bucket.
+**[Setting up SavePoint for a study](docs/build-the-app.md)** — start here. Covers how to install and configure SavePoint for your own study usage. 
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "AllowListBucket",
-            "Effect": "Allow",
-            "Action": [
-                "s3:ListBucket"
-            ],
-            "Resource": "arn:aws:s3:::game-annotator"
-        },
-        {
-            "Sid": "AllowBucketObjects",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:DeleteObject"
-            ],
-            "Resource": "arn:aws:s3:::game-annotator/*"
-        }
-    ]
-}
-```
+**[Distributing to participants](docs/distribute-to-participants.md)** — Covers how to build and send an app installer to your participants. 
 
-### 2. Trust Relationship
-The role must trust your IAM user to allow the `sts:AssumeRole` action. Update the Principal ARN below to match your specific IAM user.
+**[How session data is stored in S3](docs/s3-data-structure.md)** — Covers how the app currently organizes tool data in S3. 
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::[YOUR AWS ACCOUNT ID]:user/gameannotator-user"
-            },
-            "Action": "sts:AssumeRole"
-        }
-    ]
-}
-```
+**[Settings guide](docs/config.md)** — Covers every setting in the app. 
 
-## Using SavePoint
-A list of settings and configurations for SavePoint can be found in config.md.
+**[Common bugs](docs/common-bugs.md)** — Covers failure modes I've experienced in my own deployment studies with SavePoint. 
+
+### For your participants
+
+**[Installing SavePoint](docs/app-installation-participants.md)** — Tells participants how to install the app from the installer you send them. 
+
+**[Setting up OBS](docs/configure-obs.md)** — Participant instructions for setting up OBS. Only needed if you choose to have OBS as your recording backend (considered more robust but more annoying; see [here](docs/build-the-app.md) for more info). 
+
+**[Using SavePoint](docs/using-the-app.md)** — How to actually use the app. 

@@ -766,6 +766,21 @@
       }
     }
 
+    // Chromium keeps the backing file open for as long as a <video> has a src,
+    // which blocks deleting it on Windows. Clearing src and reloading drops it.
+    function releaseSessionMedia(container) {
+      if (!container) return;
+      container.querySelectorAll('video').forEach((videoEl) => {
+        try {
+          videoEl.pause();
+          videoEl.removeAttribute('src');
+          videoEl.load();
+        } catch (err) {
+          console.warn('Could not release video element before delete:', err);
+        }
+      });
+    }
+
     async function createSession(session) {
       const sessionDiv = document.createElement('div');
       sessionDiv.className = 'session';
@@ -794,6 +809,9 @@
 
       deleteSessionBtn.onclick = async () => {
         if (!confirm('Are you sure you want to delete this entire session (video, metadata, and annotations)?')) return;
+        // Windows will not delete a file this player still holds open, so let
+        // go of the video before asking the main process to remove it.
+        releaseSessionMedia(sessionDiv);
         try {
           if (session.source === 'local') {
             await ipcRenderer.invoke('delete-local-session', {
@@ -801,12 +819,16 @@
               fileTimestamp: session.fileTimestamp,
             });
           } else {
-            await client.deleteSession(session.videoUrl);
+            // deleteSession reports failure by returning false rather than throwing.
+            const deleted = await client.deleteSession(session.videoUrl);
+            if (deleted === false) {
+              throw new Error('The storage backend reported a failed delete.');
+            }
           }
           sessionDiv.remove();
         } catch (err) {
           console.error('Failed to delete session:', err);
-          alert('Error deleting session.');
+          alert(`Error deleting session: ${err && err.message ? err.message : err}`);
         }
       };
 
