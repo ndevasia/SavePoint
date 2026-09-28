@@ -48,44 +48,6 @@ both machines.
 app outright on first launch. Both are expected and both are covered in the
 participant instructions, but tell participants in advance.
 
-**The icons need attention.** Three things:
-
-- `icons/icon.ico` has to be **at least 256x256**, or electron-builder stops with
-  `image icons\icon.ico must be at least 256x256`. That is a hard build failure,
-  not a warning.
-- A single 256x256 image satisfies the build, but a `.ico` ideally carries
-  16, 24, 32, 48, 64, 128, and 256 pixel versions so Windows doesn't have to
-  downscale for list views and the taskbar. Note that electron-builder's own
-  PNG-to-ICO conversion only emits a single 256x256, so use a real icon tool if
-  you want the smaller sizes.
-- There is no `icons/icon.icns`, so Mac builds fall back to the default Electron
-  icon. The easiest way to get one is to keep a **1024x1024 PNG** and point
-  `mac.icon` at it — electron-builder converts it to a complete `.icns` at build
-  time. On a Mac you can also build one by hand with `iconutil -c icns
-  icon.iconset`.
-
-`icons/` is listed in `.gitignore`, so a fresh clone has none of these files.
-Remove that entry and commit the icons, or drop the `icon` keys from the build
-config.
-
-After replacing an icon, Windows may keep showing the old one from Explorer's
-icon cache rather than the new build. `ie4uinit.exe -show` refreshes it; copying
-the executable to a new filename is a quick way to confirm what is really
-embedded.
-
-### FFMPEG comes with the build
-
-Nothing to do here: `ffmpeg-static` is a dependency, so `npm install` fetches a
-prebuilt FFMPEG binary and `npm run dist` packages it. Participants do not have to
-install FFMPEG themselves whichever recording backend you choose.
-
-Two side effects worth knowing. It adds roughly 80MB to each installer. And the
-binary it downloads is only for the platform you install on, which is another
-reason the Windows installer has to be built on Windows and the Mac one on a Mac.
-
-The bundled FFMPEG is GPL licensed, so if you redistribute builds beyond your own
-study participants, check that the terms suit you.
-
 ---
 
 ## 2. Test the build before sending it out
