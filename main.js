@@ -37,10 +37,10 @@ let reviewWindow = null;
 let ffmpegProcess = null;
 let currentRecordingPath = null;
 let ffmpegExecutablePath = null;
-let recordingReady = false;
 const obs = new OBSWebSocket();
 let isOBSConnected = false;
 let obsListenerAttached = false;
+let systemAudioWarningShown = false;
 let appConfig = {
   recordAllDisplays: true,
   selectedDisplayId: null,
@@ -160,14 +160,45 @@ async function ensureLocalAnnotationsFile() {
   }
 }
 
+// Returns the error that stopped the delete, or null if the file is gone.
+async function removeFileIfPresent(target, attempts = 4, delayMs = 150) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fs.promises.unlink(target);
+      return null;
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        return null;
+      }
+      // Windows refuses to delete a file another handle still holds open --
+      // typically a <video> element that has not finished releasing it yet.
+      const retryable = err.code === 'EBUSY' || err.code === 'EPERM';
+      if (!retryable || attempt === attempts) {
+        return err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  return null;
+}
+
 async function cleanupLocalSession(username, fileTimestamp) {
   const paths = getLocalSessionPaths(username, fileTimestamp);
   const targets = [paths.videoPath, paths.metadataPath, paths.annotationsPath];
-  await Promise.all(targets.map(async (target) => {
-    if (fs.existsSync(target)) {
-      await fs.promises.unlink(target);
-    }
-  }));
+
+  // Each file is attempted independently so one locked file does not leave the
+  // rest of the session behind.
+  const results = await Promise.all(
+    targets.map(async (target) => ({ target, error: await removeFileIfPresent(target) }))
+  );
+
+  const failures = results.filter((result) => result.error);
+  if (failures.length) {
+    const summary = failures
+      .map(({ target, error }) => `${path.basename(target)} (${error.code || error.message})`)
+      .join(', ');
+    throw new Error(`Could not delete ${summary}. The file may still be open in the app.`);
+  }
 }
 
 function parseSessionTimestamp(base) {
@@ -711,16 +742,24 @@ function createHomeWindow() {
       console.log('Home window ready');
     });
 
+    // cleanup() closes the window, which fires 'closed' and would settle the
+    // promise a second time, so the first settle wins and the rest are ignored.
+    let settled = false;
+    const settle = (choice) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(choice);
+    };
+
     // Handlers for user actions
     const handleStart = () => {
       console.log("User chose: start new session");
-      cleanup();
-      resolve("start");
+      settle("start");
     };
     const handlePast = () => {
       console.log("User chose: view past sessions");
-      cleanup();
-      resolve("past");
+      settle("past");
     };
 
     // Cleanup function to remove listeners + close window
@@ -737,8 +776,9 @@ function createHomeWindow() {
     ipcMain.on('open-start-session', handleStart);
     ipcMain.on('open-past-sessions', handlePast);
 
-    // Ensure window closure also cleans up listeners
-    homeWindow.on('closed', () => cleanup());
+    // Ensure window closure also cleans up listeners and never leaves an
+    // awaited choice hanging.
+    homeWindow.on('closed', () => settle('close'));
   });
 }
 
@@ -779,6 +819,22 @@ function getFFMpegPlatform() {
   return 'linux';
 }
 
+// ffmpeg-static ships a prebuilt binary, so participants do not have to install
+// FFMPEG themselves. In a packaged build it lives outside the asar archive
+// (asarUnpack in package.json), because an executable inside app.asar cannot be
+// spawned.
+function resolveBundledFFMpegPath() {
+  try {
+    const bundled = require('ffmpeg-static');
+    if (!bundled) return null;
+    return app.isPackaged
+      ? bundled.replace('app.asar', 'app.asar.unpacked')
+      : bundled;
+  } catch {
+    return null;
+  }
+}
+
 function resolveFFMpegPath() {
   const binaryName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
   const platform = getFFMpegPlatform();
@@ -790,6 +846,7 @@ function resolveFFMpegPath() {
     path.join(appPath, '..', 'bin', platform, arch, binaryName),
     path.join(process.resourcesPath || '', 'bin', platform, arch, binaryName),
     path.join(appPath, 'bin', platform, arch, binaryName),
+    resolveBundledFFMpegPath(),
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -899,11 +956,60 @@ function parseDShowDevices(ffmpegPath) {
       id: nameMatch[1],
       label: nameMatch[1],
       altName: null,
-      kind: nameMatch[2] ? nameMatch[2].toLowerCase() : section,
+      mediaType: nameMatch[2] ? nameMatch[2].toLowerCase() : section,
     });
   });
 
-  return devices.filter((device) => device.kind === 'audio');
+  return devices.filter((device) => device.mediaType === 'audio');
+}
+
+// Only a loopback device captures what the machine is playing (game sound).
+// A plain microphone picks up the room, which is not what "record audio"
+// means for gameplay -- so the two are distinguished and loopback preferred.
+const SYSTEM_AUDIO_HINTS = [
+  'stereo mix',
+  'what u hear',
+  'wave out mix',
+  'loopback',
+  'virtual-audio-capturer',
+  'cable output',
+  'voicemeeter out',
+  'vb-audio',
+  'blackhole',
+  'soundflower',
+];
+
+// Deliberately not awaited and never the Sync variant: showMessageBoxSync
+// blocks the main process event loop, which freezes every open window.
+function showNoSystemAudioWarning(parentWindow) {
+  dialog.showMessageBox(parentWindow || undefined, {
+    type: 'warning',
+    buttons: ['OK'],
+    title: 'Game Sound Cannot Be Recorded',
+    message: 'This computer has no system-audio capture device, so FFMPEG can only record a microphone.',
+    detail: getNoSystemAudioDetail(),
+  });
+}
+
+function getNoSystemAudioDetail() {
+  return [
+    'Recordings will capture the room through your microphone, but not the sound the game is playing.',
+    '',
+    'Windows does not expose speaker output as a recording device by default, and this machine does not provide one. To capture game sound you can:',
+    '',
+    '  1. Enable "Stereo Mix" in Windows sound settings (Sound > Recording > right click > Show Disabled Devices). Not all audio hardware offers it.',
+    '  2. Install a virtual loopback driver such as VB-Cable, set it as your playback device, then select its capture side as the audio input device.',
+    '  3. Record with OBS instead, which captures desktop audio without extra setup.',
+  ].join('\n');
+}
+
+function classifyAudioDevice(label) {
+  const lower = String(label).toLowerCase();
+  // PulseAudio exposes loopback as monitor sources.
+  if (lower.endsWith('.monitor') || lower.startsWith('monitor of')) {
+    return 'system';
+  }
+  return SYSTEM_AUDIO_HINTS.some((hint) => lower.includes(hint)) ? 'system' : 'microphone';
 }
 
 function parseAVFoundationDevices(ffmpegPath) {
@@ -966,18 +1072,21 @@ function parsePulseSources() {
 function listAudioCaptureDevices(ffmpegPath) {
   const resolvedPath = ffmpegPath || ffmpegExecutablePath || resolveFFMpegPath();
 
+  let devices = [];
   try {
     if (process.platform === 'win32') {
-      return parseDShowDevices(resolvedPath);
+      devices = parseDShowDevices(resolvedPath);
+    } else if (process.platform === 'darwin') {
+      devices = parseAVFoundationDevices(resolvedPath).audioDevices;
+    } else {
+      devices = parsePulseSources();
     }
-    if (process.platform === 'darwin') {
-      return parseAVFoundationDevices(resolvedPath).audioDevices;
-    }
-    return parsePulseSources();
   } catch (err) {
     console.warn('Could not enumerate audio capture devices:', err.message);
     return [];
   }
+
+  return devices.map((device) => ({ ...device, kind: classifyAudioDevice(device.label) }));
 }
 
 function resolveAudioCaptureDevice(ffmpegPath) {
@@ -991,11 +1100,22 @@ function resolveAudioCaptureDevice(ffmpegPath) {
     ? devices.find((device) => String(device.id) === String(configuredId))
     : null;
 
-  if (configuredId && !configured) {
-    console.warn(`Configured audio device "${configuredId}" was not found; falling back to "${devices[0].label}".`);
+  if (configured) {
+    return configured;
   }
 
-  return configured || devices[0];
+  // Default to loopback so a gameplay recording captures game sound rather
+  // than whichever microphone happened to be enumerated first.
+  const fallback = devices.find((device) => device.kind === 'system') || devices[0];
+
+  if (configuredId) {
+    console.warn(`Configured audio device "${configuredId}" was not found; falling back to "${fallback.label}".`);
+  }
+  if (fallback.kind !== 'system') {
+    console.warn(`No system-audio (loopback) device is available; "${fallback.label}" will capture microphone input only.`);
+  }
+
+  return fallback;
 }
 
 function findMacScreenDeviceIndex(videoDevices) {
@@ -1110,7 +1230,7 @@ function getFFMpegRecordingArgs(ffmpegPath, outputPath, { includeAudio = false }
   );
 
   if (audioDevice) {
-    console.log(`Capturing audio from: ${audioDevice.label}`);
+    console.log(`Capturing audio from: ${audioDevice.label} (${audioDevice.kind})`);
     args.push(
       '-c:a', 'aac',
       '-b:a', '160k'
@@ -1344,11 +1464,24 @@ function attachOBSRecordingListener() {
       console.log('OBS RecordStateChanged event:', data);
     }
   });
+  // Without this the flag goes stale when OBS quits mid-run, and the next
+  // session would skip reconnecting and fail on the first call instead.
+  obs.on('ConnectionClosed', () => {
+    isOBSConnected = false;
+  });
+  obs.on('ConnectionError', () => {
+    isOBSConnected = false;
+  });
   obsListenerAttached = true;
 }
 
 async function checkOBSAvailable() {
   try {
+    if (isOBSConnected) {
+      // Confirm the existing socket is still alive rather than trusting the flag.
+      await obs.call('GetVersion');
+      return { available: true, details: '' };
+    }
     await obs.connect();
     isOBSConnected = true;
     return { available: true, details: '' };
@@ -1356,21 +1489,6 @@ async function checkOBSAvailable() {
     isOBSConnected = false;
     return { available: false, details: error.message || String(error) };
   }
-}
-
-function showOBSMissingDialog(details = '') {
-  const extraDetails = details ? `\n\nTechnical details:\n${details}` : '';
-  const choice = dialog.showMessageBoxSync({
-    type: 'error',
-    buttons: ['Quit App', 'Continue (Past Sessions Only)'],
-    defaultId: 0,
-    cancelId: 0,
-    title: 'OBS Not Found',
-    message: 'Could not connect to OBS via WebSocket.',
-    detail: `Make sure OBS Studio is running with the WebSocket server enabled (Tools > WebSocket Server Settings).${extraDetails}`,
-  });
-
-  return choice === 1;
 }
 
 async function connectOBS() {
@@ -1643,19 +1761,75 @@ function registerShortcuts() {
   });
 }
 
+// Checked per session rather than at launch: whether OBS is running can change
+// while the app is open, and the backend itself can be switched in settings.
+async function checkRecordingBackendReady() {
+  if (isOBSBackend()) {
+    attachOBSRecordingListener();
+    const obsCheck = await checkOBSAvailable();
+    if (!obsCheck.available) {
+      console.error(`OBS check failed: ${obsCheck.details}`);
+    } else {
+      console.log('OBS WebSocket connection verified');
+    }
+    return { ready: obsCheck.available, backend: 'OBS', details: obsCheck.details };
+  }
+
+  const ffmpegCheck = checkFFMpegAvailable();
+  ffmpegExecutablePath = ffmpegCheck.path;
+  if (!ffmpegCheck.available) {
+    console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
+    if (ffmpegCheck.details) {
+      console.error(`FFMPEG details: ${ffmpegCheck.details}`);
+    }
+  } else {
+    console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
+  }
+  return { ready: ffmpegCheck.available, backend: 'FFMPEG', details: ffmpegCheck.details };
+}
+
+// Returns true if the user wants to retry the check. Uses the async dialog so
+// the main process keeps running while it is open; the Sync variant freezes
+// every window, and at this point the home window has already closed.
+async function showRecordingUnavailableDialog(backend, details = '') {
+  const extraDetails = details ? `\n\nTechnical details:\n${details}` : '';
+  const detail = backend === 'OBS'
+    ? `Start OBS Studio with the WebSocket server enabled (Tools > WebSocket Server Settings), then try again.${extraDetails}`
+    : `The app could not find a working FFMPEG binary. Install or configure FFMPEG, then try again.${extraDetails}`;
+
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    buttons: ['Try Again', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Recording Unavailable',
+    message: `Cannot start a new session because ${backend} is not available.`,
+    detail,
+  });
+
+  return response === 0;
+}
+
 async function startSession() {
   console.log('➡ User starting session flow');
-  if (!recordingReady) {
-    const backendName = isOBSBackend() ? 'OBS' : 'FFMPEG';
-    dialog.showMessageBoxSync({
-      type: 'warning',
-      buttons: ['OK'],
-      defaultId: 0,
-      title: 'Recording Unavailable',
-      message: `Cannot start a new session because ${backendName} is not available.`,
-      detail: `Configure ${backendName} and restart the app.`,
-    });
-    return;
+
+  let backendStatus = await checkRecordingBackendReady();
+  while (!backendStatus.ready) {
+    if (!(await showRecordingUnavailableDialog(backendStatus.backend, backendStatus.details))) {
+      return false;
+    }
+    backendStatus = await checkRecordingBackendReady();
+  }
+
+  // Someone who never opens settings would otherwise only find out afterwards
+  // that a whole session recorded no game sound. Warned once per run, and not
+  // awaited so the dialog never holds up the session.
+  if (!isOBSBackend() && appConfig.captureAudio === true && !systemAudioWarningShown) {
+    const audioDevices = listAudioCaptureDevices();
+    if (!audioDevices.some((device) => device.kind === 'system')) {
+      systemAudioWarningShown = true;
+      showNoSystemAudioWarning();
+    }
   }
 
   // Reset per-session metadata so files are never reused across recordings.
@@ -1683,6 +1857,8 @@ async function startSession() {
       recentNotesWindow.webContents.send('set-video-start-time', videoStart);
     }
   }
+
+  return true;
 }
 
 async function saveSettings(partialSettings) {
@@ -1714,14 +1890,34 @@ function getAvailableDisplays() {
 }
 
 async function handleHomeChoice(choice) {
-  if (choice === 'start') {
-    // If mainWindow is open (user came from past sessions), close it:
-    if (mainWindow) {
-      try { mainWindow.close(); } catch (e) {}
-      mainWindow = null;
+  let currentChoice = choice;
+  const wasStarting = isStarting;
+
+  try {
+    while (currentChoice === 'start') {
+      // If mainWindow is open (user came from past sessions), close it:
+      if (mainWindow) {
+        try { mainWindow.close(); } catch (e) {}
+        mainWindow = null;
+      }
+
+      // The home window is already closed here, so no window exists until the
+      // session opens one. Hold off window-all-closed until the flow settles.
+      isStarting = true;
+
+      if (await startSession()) {
+        return;
+      }
+
+      // Recording could not start, so go back to the home window instead of
+      // leaving the app running with nothing visible.
+      currentChoice = await createHomeWindow();
     }
-    await startSession();
-  } else if (choice === 'past') {
+  } finally {
+    isStarting = wasStarting;
+  }
+
+  if (currentChoice === 'past') {
     // Make sure we don't leave duplicate mainWindows
     if (!mainWindow) createMainWindow();
     else mainWindow.show();
@@ -1738,25 +1934,15 @@ app.whenReady().then(async () => {
   awsManager = new AWSManager(sessionMetadata.getUsername());
   await awsManager.init();
 
+  // Whether OBS is running is checked when a session starts, not here -- the
+  // user can launch OBS after the app. A missing FFMPEG binary will not fix
+  // itself mid-run, so that one is still worth flagging up front.
   if (isOBSBackend()) {
     attachOBSRecordingListener();
-    const obsCheck = await checkOBSAvailable();
-    recordingReady = obsCheck.available;
-    if (recordingReady) {
-      console.log('OBS WebSocket connection verified');
-    } else {
-      console.error(`OBS check failed: ${obsCheck.details}`);
-      const continueWithoutRecording = showOBSMissingDialog(obsCheck.details);
-      if (!continueWithoutRecording) {
-        app.quit();
-        return;
-      }
-    }
   } else {
     const ffmpegCheck = checkFFMpegAvailable();
-    recordingReady = ffmpegCheck.available;
     ffmpegExecutablePath = ffmpegCheck.path;
-    if (recordingReady) {
+    if (ffmpegCheck.available) {
       console.log(`FFMPEG ready at: ${ffmpegExecutablePath}`);
     } else {
       console.error(`FFMPEG check failed for path: ${ffmpegExecutablePath}`);
@@ -1822,6 +2008,11 @@ app.whenReady().then(async () => {
       settingsWindow.close();
     }
   });
+  ipcMain.on('show-no-system-audio-warning', () => {
+    // Seeing it here means the session-start warning would be a repeat.
+    systemAudioWarningShown = true;
+    showNoSystemAudioWarning(settingsWindow);
+  });
   ipcMain.on('show-obs-reminder', () => {
     dialog.showMessageBox(settingsWindow || undefined, {
       type: 'info',
@@ -1859,6 +2050,7 @@ app.whenReady().then(async () => {
     return listAudioCaptureDevices().map((device) => ({
       id: String(device.id),
       label: device.label,
+      kind: device.kind,
     }));
   });
   ipcMain.handle('save-settings', async (event, settings) => {

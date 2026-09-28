@@ -137,7 +137,7 @@
 
     <div class="settings-field" style="margin-top: 24px; border-top: 1px solid rgba(0, 255, 255, 0.3); padding-top: 18px;">
       <strong style="color: #00ffff;">Hotkey Bindings</strong>
-      <small style="color: #9fe9ff; margin-bottom: 12px; display: block;">Customize keyboard shortcuts (Ctrl/Cmd+Shift+..., Ctrl/Cmd+1, etc.)</small>
+      <small style="color: #9fe9ff; margin-bottom: 12px; display: block;">Customize keyboard shortcuts (Ctrl/Cmd+Shift+N, Ctrl/Cmd+Shift+1, etc.)</small>
       
       <div style="display: flex; flex-direction: column; gap: 12px;">
         <div style="display: flex; gap: 8px; align-items: center;">
@@ -206,6 +206,7 @@
     const displaySelect = document.getElementById('display-select');
     const displayHelp = document.getElementById('display-help');
     const captureAudioCheckbox = document.getElementById('capture-audio');
+    let availableAudioDevices = [];
     const audioDeviceSelect = document.getElementById('audio-device-select');
     const audioHelp = document.getElementById('audio-help');
 
@@ -256,6 +257,7 @@
     }
 
     function renderAudioDeviceOptions(devices, selectedAudioDeviceId) {
+      availableAudioDevices = devices;
       audioDeviceSelect.innerHTML = '';
 
       if (!devices.length) {
@@ -269,17 +271,21 @@
       devices.forEach((device) => {
         const option = document.createElement('option');
         option.value = device.id;
-        option.textContent = device.label;
+        option.textContent = `${device.label} - ${device.kind === 'system' ? 'system audio' : 'microphone'}`;
         audioDeviceSelect.appendChild(option);
       });
 
       const matchingDevice = devices.find((device) => String(device.id) === String(selectedAudioDeviceId));
-      audioDeviceSelect.value = matchingDevice ? matchingDevice.id : devices[0].id;
+      // Default to system audio so gameplay sound is captured, not the room.
+      const fallbackDevice = devices.find((device) => device.kind === 'system') || devices[0];
+      audioDeviceSelect.value = matchingDevice ? matchingDevice.id : fallbackDevice.id;
     }
 
     function updateAudioFieldState() {
       const usingOBS = useOBSRecordingCheckbox.checked;
       const hasDevices = Boolean(audioDeviceSelect.value);
+      const selectedOption = audioDeviceSelect.selectedOptions[0];
+      const selectedIsSystem = Boolean(selectedOption && / - system audio$/.test(selectedOption.textContent));
 
       captureAudioCheckbox.disabled = usingOBS;
       audioDeviceSelect.disabled = usingOBS || !captureAudioCheckbox.checked || !hasDevices;
@@ -287,11 +293,15 @@
       if (usingOBS) {
         audioHelp.textContent = 'Audio capture is managed inside OBS while OBS recording is enabled.';
       } else if (!hasDevices) {
-        audioHelp.textContent = 'No audio capture devices were detected. On Windows, enable Stereo Mix or install a loopback driver to record desktop sound.';
+        audioHelp.textContent = 'No audio capture devices were detected.';
       } else if (!captureAudioCheckbox.checked) {
         audioHelp.textContent = 'Enable audio recording to choose a capture device.';
+      } else if (!availableAudioDevices.some((device) => device.kind === 'system')) {
+        audioHelp.textContent = 'No system-audio device found, so only microphone input can be recorded. To capture game sound, enable Stereo Mix in Windows sound settings if your hardware offers it, install a loopback driver such as VB-Cable, or record with OBS instead.';
+      } else if (!selectedIsSystem) {
+        audioHelp.textContent = 'This is a microphone; it records the room, not game sound. Pick a system-audio device to capture what the game is playing.';
       } else {
-        audioHelp.textContent = 'Choose which capture device supplies the audio track.';
+        audioHelp.textContent = 'Records what the machine is playing, including game sound.';
       }
     }
 
@@ -335,12 +345,12 @@
           hotkeyInputs.showSessions.value = settings.hotkeys.showPastSessions || 'CommandOrControl+Shift+O';
           hotkeyInputs.quitRecording.value = settings.hotkeys.quitRecording || 'CommandOrControl+Shift+Q';
           hotkeyInputs.toggleOverlay.value = settings.hotkeys.toggleRecentNotesOverlay || 'CommandOrControl+Shift+P';
-          hotkeyInputs.emoji1.value = settings.hotkeys.emoji1 || 'CommandOrControl+1';
-          hotkeyInputs.emoji2.value = settings.hotkeys.emoji2 || 'CommandOrControl+2';
-          hotkeyInputs.emoji3.value = settings.hotkeys.emoji3 || 'CommandOrControl+3';
-          hotkeyInputs.emoji4.value = settings.hotkeys.emoji4 || 'CommandOrControl+4';
-          hotkeyInputs.emoji5.value = settings.hotkeys.emoji5 || 'CommandOrControl+5';
-          hotkeyInputs.emoji6.value = settings.hotkeys.emoji6 || 'CommandOrControl+6';
+          hotkeyInputs.emoji1.value = settings.hotkeys.emoji1 || 'CommandOrControl+Shift+1';
+          hotkeyInputs.emoji2.value = settings.hotkeys.emoji2 || 'CommandOrControl+Shift+2';
+          hotkeyInputs.emoji3.value = settings.hotkeys.emoji3 || 'CommandOrControl+Shift+3';
+          hotkeyInputs.emoji4.value = settings.hotkeys.emoji4 || 'CommandOrControl+Shift+4';
+          hotkeyInputs.emoji5.value = settings.hotkeys.emoji5 || 'CommandOrControl+Shift+5';
+          hotkeyInputs.emoji6.value = settings.hotkeys.emoji6 || 'CommandOrControl+Shift+6';
         }
       } catch (error) {
         console.error('Failed to load display settings:', error);
@@ -384,7 +394,19 @@
     }
 
     recordAllDisplaysCheckbox.addEventListener('change', updateDisplayFieldState);
-    captureAudioCheckbox.addEventListener('change', updateAudioFieldState);
+    function hasSystemAudioDevice() {
+      return availableAudioDevices.some((device) => device.kind === 'system');
+    }
+
+    captureAudioCheckbox.addEventListener('change', () => {
+      updateAudioFieldState();
+      // Say so at the moment audio is turned on, rather than letting someone
+      // discover after a session that the game sound was never captured.
+      if (captureAudioCheckbox.checked && !useOBSRecordingCheckbox.checked && !hasSystemAudioDevice()) {
+        ipcRenderer.send('show-no-system-audio-warning');
+      }
+    });
+    audioDeviceSelect.addEventListener('change', updateAudioFieldState);
     useOBSRecordingCheckbox.addEventListener('change', () => {
       updateDisplayFieldState();
       updateAudioFieldState();

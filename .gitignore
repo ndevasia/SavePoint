@@ -3,11 +3,7 @@ build
 npm-debug.log
 .env
 .DS_Store
-videos/
-annotations/
-metadata/
 config.json
 .vscode/
 dist/
-icons/
 ndevasia/
